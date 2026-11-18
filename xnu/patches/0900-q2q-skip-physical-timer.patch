@@ -1,0 +1,22 @@
+From: q2q port
+Subject: [PATCH] q2q: skip the precautionary CNTP_CTL_EL0 write on SWEET
+
+On the Galaxy Z Fold3 (SM8350) the hypervisor traps EL1 access to the ARM
+physical timer, so _enable_virtual_timer()'s 'MSR CNTP_CTL_EL0' raises an
+undefined-instruction exception (panic in _fiq_context_init+0x14). SWEET only
+uses the virtual timer (CNTV, INTID 19), so the write is skipped there.
+
+---
+diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
+--- a/osfmk/arm64/machine_routines.c
++++ b/osfmk/arm64/machine_routines.c
+@@ -2274,7 +2274,9 @@
+ 
+ 	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
+ 	/* disable the physical timer as a precaution, as its registers reset to architecturally unknown values */
++#if !defined(SWEET) /* q2q/SM8350: EL1 physical-timer access traps (UNDEF); timer runs on CNTV */
+ 	__builtin_arm_wsr64("CNTP_CTL_EL0", CNTP_CTL_EL0_IMASKED);
++#endif
+ }
+ 
+ void
