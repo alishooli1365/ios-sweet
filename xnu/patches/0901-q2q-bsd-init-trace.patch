@@ -1,0 +1,23 @@
+From: q2q port
+Subject: [PATCH] q2q: trace bsd_init steps on SWEET
+
+Enable XNU's DEBUG_BSDINIT step logging (bsd_init_kprintf -> kprintf) on SWEET.
+On the Galaxy Z Fold3 the kernel stalls silently inside bsd_init after Mach/IOKit
+lockdown; this prints each bsd_init step so the stalling step is visible.
+
+---
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -490,7 +490,11 @@
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
+ #endif
+ 
++#if defined(SWEET)
++#define DEBUG_BSDINIT 1 /* q2q: trace bsd_init steps on the console */
++#else
+ #define DEBUG_BSDINIT 0
++#endif
+ 
+ #if DEBUG_BSDINIT
+ #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
