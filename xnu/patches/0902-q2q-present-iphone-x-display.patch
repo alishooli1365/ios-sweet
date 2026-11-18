@@ -1,0 +1,22 @@
+From: q2q port
+Subject: [PATCH] q2q: present the iPhone X display on panels larger in one dimension
+
+The Galaxy Z Fold3 inner panel is 2208x1768 (native landscape scan). ios-sweet only
+presented 1125x2436 when the panel was smaller in both dimensions, so iOS saw the raw
+panel and backboardd kept asking for AppleM2ScalerCSCDriver. Present 1125x2436 whenever
+sweetfb_native is not set; the swap copy clips on all edges (centered, cropped 334 rows
+top and bottom on q2q).
+
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -170,7 +170,7 @@
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
++	if (!native) { /* q2q: also when the panel is larger in one dimension; the swap copy clips */
+ 		fLogicalW = SWEET_FB_LOGICAL_W;
+ 		fLogicalH = SWEET_FB_LOGICAL_H;
+ 	}
