@@ -96,10 +96,10 @@ index ccbb188..777aca4 100644
  
 +#if defined(SWEET)
 +	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-+	MOV64	x0, (0xe4000000 + 2176 * 7072)
++	MOV64	x0, (0xe4000000 + 1736 * 8832)
 +	mov		w1, #-1
 +	mov		x2, #32
-+	mov		x4, #7072
++	mov		x4, #8832
 +Lsweet_mark_row:
 +	mov		x3, #64
 +	mov		x5, x0
@@ -159,9 +159,9 @@ index 0000000..8f4c808
 +#include <kern/misc_protos.h>
 +
 +#define EARLY_FB ((volatile uint32_t *)(uintptr_t)0xe4000000)
-+#define EARLY_WIDTH 1768u
-+#define EARLY_HEIGHT 2208u
-+#define EARLY_STRIDE (7072u / 4)
++#define EARLY_WIDTH 2208u
++#define EARLY_HEIGHT 1768u
++#define EARLY_STRIDE (8832u / 4)
 +#define EARLY_SCALE 2u
 +#define EARLY_CELL_W (8u * EARLY_SCALE)
 +#define EARLY_CELL_H (16u * EARLY_SCALE)
