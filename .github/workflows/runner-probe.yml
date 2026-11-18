@@ -1,0 +1,29 @@
+name: runner-probe
+
+# Throwaway: which GitHub macOS images exist now, and which Xcode versions (and iig)
+# each one ships. The xnu build needs an Xcode 15.x iig (see xnu.yml); macos-14 is retired.
+on:
+  push:
+    branches: [q2q-runner-probe]
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [macos-15, macos-15-intel, macos-26, macos-latest]
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 10
+    steps:
+      - name: Xcode inventory
+        run: |
+          echo "image=${{ matrix.image }}"
+          sw_vers
+          uname -m
+          ls -d /Applications/Xcode*.app || true
+          for x in /Applications/Xcode_*.app; do
+            v=$(defaults read "$x/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "?")
+            iig=$(DEVELOPER_DIR="$x/Contents/Developer" xcrun --find iig 2>/dev/null || echo "no-iig")
+            echo "XCODE $x version=$v iig=$iig"
+          done
+          ls /Library/Developer/KDKs 2>/dev/null || echo "no KDKs preinstalled"
