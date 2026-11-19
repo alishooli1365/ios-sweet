@@ -10,7 +10,7 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -51,6 +51,391 @@
+@@ -51,6 +51,438 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -246,6 +246,22 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	return (r->ph - SWEET_DIAG_Y0) / SWEET_DIAG_LINE_H;
 +}
 +
++/* Decimal digits of v at out (no NUL), at most 20; returns the count. */
++static uint32_t
++sweet_fb_utoa(char *out, uint64_t v)
++{
++	char t[20];
++	uint32_t n = 0;
++	do {
++		t[n++] = (char)('0' + (v % 10u));
++		v /= 10u;
++	} while (v != 0 && n < sizeof(t));
++	for (uint32_t i = 0; i < n; i++) {
++		out[i] = t[n - 1 - i];
++	}
++	return n;
++}
++
 +/* Draw one text line (cleared to black first, cut at the bar width). */
 +static void
 +sweet_fb_diag_draw(const struct sweet_fb_rot *r, uintptr_t fb, uint32_t line, const char *text)
@@ -392,6 +408,37 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	}
 +}
 +
++/*
++ * Heartbeat, once a second from the vsync timer: redraw every stored line (whatever cleared
++ * the bar since, e.g. the power-off fade) and show the frame-side counter plus the touch
++ * driver's progress number on the last line, independent of its text lines.
++ */
++extern "C" { volatile uint32_t sweet_fb_diag_stage; }
++
++static void
++sweet_fb_diag_tick(uint64_t ticks)
++{
++	if (sweet_fb_rot_state.rot == 0 || !sweet_fb_rot_cleared || sweet_fb_diag_pixels == 0) {
++		return;
++	}
++	uint32_t last = sweet_fb_diag_lines(&sweet_fb_rot_state);
++	for (uint32_t dl = 0; dl < SWEET_DIAG_MAX_LINES && dl + 1 < last; dl++) {
++		if (sweet_fb_diag_text[dl][0] != '\0') {
++			sweet_fb_diag_draw(&sweet_fb_rot_state, sweet_fb_diag_pixels, dl, sweet_fb_diag_text[dl]);
++		}
++	}
++	char hb[32];
++	uint32_t n = 0;
++	hb[n++] = 'F'; hb[n++] = 'B'; hb[n++] = ' ';
++	n += sweet_fb_utoa(hb + n, ticks / 60u);
++	hb[n++] = ' '; hb[n++] = 'T';
++	n += sweet_fb_utoa(hb + n, sweet_fb_diag_stage);
++	hb[n] = '\0';
++	if (last > 0) {
++		sweet_fb_diag_draw(&sweet_fb_rot_state, sweet_fb_diag_pixels, last - 1, hb);
++	}
++}
++
 +/* q2q touch: view fractions (1/65536) -> sweet_hid_touch() 1080x2400 coordinates. */
 +extern "C" int
 +sweet_fb_touch_to_hid(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy)
@@ -402,7 +449,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -176,6 +561,17 @@
+@@ -176,6 +608,17 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -420,7 +467,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -359,6 +755,41 @@
+@@ -212,6 +655,9 @@
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	if ((count % 60u) == 0 && !fb->fPowerOff) {
++		sweet_fb_diag_tick(count);   /* q2q: redraw diagnostic lines */
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -359,6 +805,41 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}

@@ -22,10 +22,10 @@ index 6630131..ea13696 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..32bc941
+index 0000000..3167043
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,836 @@
+@@ -0,0 +1,854 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -57,6 +57,10 @@ index 0000000..32bc941
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern void sweet_fb_diag(unsigned line, const char *text);
 +extern int sweet_fb_touch_to_hid(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy);
++/* Progress number shown on the frame-side heartbeat line ("FB <s> T<stage>"):
++ * 1 started, 2 waited, 3 mapped, 4 clocks on, 5 SE4 set up, 6 pins, 70 chip id, 71 reset,
++ * 72 scan on, 8 running; 9x = stopped (91 map, 92 clock, 93 SE4 not SPI/busy, 94 no answer). */
++extern volatile uint32_t sweet_fb_diag_stage;
 +void q2q_touch_init(void);
 +
 +/*
@@ -693,6 +697,7 @@ index 0000000..32bc941
 +	const uint8_t inten[3] = {0xA4, 0x01, 0x01}, rev = 0x87;
 +	struct q2qt_ev o;
 +
++	sweet_fb_diag_stage = 70;
 +	qt_diag(DL_STEP, "STEP CHIP ID");
 +	int e = qt_read(&rid, 1, id, sizeof(id));
 +	q2qt_hex(h, sizeof h, id, 5);
@@ -703,6 +708,7 @@ index 0000000..32bc941
 +	snprintf(b, sizeof b, "HW%s %s", e ? "ERR" : "", h);
 +	qt_diag(DL_HWID, b);
 +
++	sweet_fb_diag_stage = 71;
 +	qt_diag(DL_STEP, "STEP RESET");
 +	(void)qt_write(reset, sizeof(reset));
 +	qt_sleep_ms(30);
@@ -724,6 +730,7 @@ index 0000000..32bc941
 +	snprintf(b, sizeof b, "RESET %s %u", ready ? "READY" : "NO READY", tries);
 +	qt_diag(DL_RESET, b);
 +
++	sweet_fb_diag_stage = 72;
 +	qt_diag(DL_STEP, "STEP SCAN ON");
 +	(void)qt_write(ttype, sizeof(ttype));
 +	qt_sleep_ms(10);
@@ -760,28 +767,36 @@ index 0000000..32bc941
 +	(void)PE_parse_boot_argn("q2qtswap", &qt.map.swap, sizeof(qt.map.swap));
 +	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
 +	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
-+	qt_diag(DL_TITLE, "Q2Q TOUCH V1");
++	sweet_fb_diag_stage = 1;
++	qt_diag(DL_TITLE, "Q2Q TOUCH V2");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
++	sweet_fb_diag_stage = 2;
 +
 +	qt_diag(DL_STEP, "STEP MAP");
 +	qt.gcc = ml_io_map(GCC_PA, GCC_SIZE);
 +	qt.tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
 +	qt.se = ml_io_map(SE_PA, SE_SIZE);
 +	if (!qt.gcc || !qt.tlmm || !qt.se) {
++		sweet_fb_diag_stage = 91;
 +		qt_diag(DL_STATE, "STOP: MAP FAILED");
 +		goto out;
 +	}
++	sweet_fb_diag_stage = 3;
 +	qt_diag(DL_STEP, "STEP CLOCKS");
 +	if (!qt_clocks()) {
++		sweet_fb_diag_stage = 92;
 +		qt_diag(DL_STATE, "STOP: SE4 CLOCK OFF");
 +		goto out;
 +	}
++	sweet_fb_diag_stage = 4;
 +	qt_diag(DL_STEP, "STEP SE4");
 +	if (!qt_se_setup(div)) {
++		sweet_fb_diag_stage = 93;
 +		goto out;
 +	}
++	sweet_fb_diag_stage = 5;
 +	qt_diag(DL_STEP, "STEP PINS");
 +	snprintf(b, sizeof b, "P%03X %03X %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_MISO)) & 0x3ffu,
 +	    qt_rd(qt.tlmm, TLMM_CFG(PIN_CS)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_INT)) & 0x3ffu,
@@ -793,11 +808,14 @@ index 0000000..32bc941
 +	qt_pin(PIN_CLK, 1, 0, 6, false, false);
 +	qt_pin(PIN_INT, 0, 0, 2, false, false);
 +	delay(100);
++	sweet_fb_diag_stage = 6;
 +
 +	if (!qt_chip_start()) {
++		sweet_fb_diag_stage = 94;
 +		qt_diag(DL_STATE, "STOP: NO ANSWER ON SPI");
 +		goto out;
 +	}
++	sweet_fb_diag_stage = 8;
 +	qt_diag(DL_STATE, "RUNNING - TOUCH SCREEN");
 +	uint32_t mask = 0, ticks = 0;
 +	uint64_t last_draw = 0;
