@@ -22,10 +22,10 @@ index 6630131..ea13696 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..34ee604
+index 0000000..d5ded2a
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1328 @@
+@@ -0,0 +1,1375 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -57,6 +57,7 @@ index 0000000..34ee604
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
 +extern void sweet_fb_diag(unsigned line, const char *text);
 +extern int sweet_fb_touch_to_hid(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy);
++extern int sweet_fb_touch_to_hid_cover(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy);
 +/* Progress number shown on the frame-side heartbeat line ("FB <s> T<stage>"):
 + * 1 started, 2 waited, 3 mapped, 4 clocks on, 5 SE4 set up, 6 pins, 60 powering touch,
 + * 61 touch power on, 62 PMIC did not answer / power not confirmed, 70 chip id, 71 reset,
@@ -583,6 +584,26 @@ index 0000000..34ee604
 +} qt;
 +static int qt_sleep_chan;
 +
++/*
++ * One touch controller ("iPhone Duo": the inner one on SPI and the cover one on I2C both run,
++ * since iOS is mirrored on both panels). Only one side reports at a time: a side's touches are
++ * ignored while the other side has had a finger down in the last 3 s (a hand holding the
++ * phone touches the outer side), and palm events are dropped.
++ */
++struct qt_ctl {
++	bool on, i2c, cover;
++	uint32_t int_pin;
++	uint32_t mask;            /* fingers down now */
++	uint32_t active;          /* fingers reported down to HID */
++	int32_t hx[Q2QT_FINGERS], hy[Q2QT_FINGERS];
++	uint32_t rx[Q2QT_FINGERS], ry[Q2QT_FINGERS];
++	struct q2qt_map map;
++	uint64_t last_us;         /* last time a finger was down */
++	uint32_t events, ticks;
++};
++static struct qt_ctl qt_in, qt_cv;
++static unsigned qt_dl_off;    /* diagnostic line offset: 0 inner, 20 cover */
++
 +static uint32_t
 +qt_rd(vm_offset_t b, uint32_t off)
 +{
@@ -611,7 +632,7 @@ index 0000000..34ee604
 +static void
 +qt_diag(unsigned line, const char *text)
 +{
-+	sweet_fb_diag(line, text);
++	sweet_fb_diag(line + qt_dl_off, text);
 +	printf("Q2Q TOUCH: %s\n", text);
 +}
 +
@@ -1035,24 +1056,26 @@ index 0000000..34ee604
 +}
 +
 +static void
-+qt_report(uint32_t mask)
++qt_report(struct qt_ctl *c, uint32_t mask)
 +{
 +	for (uint32_t id = 0; id < Q2QT_FINGERS; id++) {
 +		uint32_t bit = 1u << id;
 +		if (mask & bit) {
-+			sweet_hid_touch((int)id, 1, qt.hx[id], qt.hy[id]);
-+		} else if (qt.active & bit) {
-+			sweet_hid_touch((int)id, 0, qt.hx[id], qt.hy[id]);
++			sweet_hid_touch((int)id, 1, c->hx[id], c->hy[id]);
++		} else if (c->active & bit) {
++			sweet_hid_touch((int)id, 0, c->hx[id], c->hy[id]);
 +		}
 +	}
-+	qt.active = mask;
++	c->active = mask;
 +}
 +
-+/* Read all pending events; returns the number of events read, or -errno. */
++/* Read all pending events of controller c; returns the number of events read, or -errno. */
 +static int
-+qt_poll(uint32_t *mask, bool *changed)
++qt_poll(struct qt_ctl *c, bool *changed)
 +{
 +	static uint8_t evs[Q2QT_FIFO_MAX * Q2QT_EVENT_SIZE];
++	uint32_t *mask = &c->mask;
++	qt.i2c = c->i2c;
 +	/* SPI (inner): 0x87 for one and for the rest; I2C (cover): 0x60 one, 0x61 all */
 +	const uint8_t cmd = qt.i2c ? 0x60 : 0x87, cmd_all = qt.i2c ? 0x61 : 0x87;
 +	int err = qt_read(&cmd, 1, evs, Q2QT_EVENT_SIZE);
@@ -1074,6 +1097,7 @@ index 0000000..34ee604
 +	for (uint32_t i = 0; i < count; i++) {
 +		q2qt_parse(evs + i * Q2QT_EVENT_SIZE, &o);
 +		qt.events++;
++		c->events++;
 +		if (o.kind == Q2QT_EV_ERROR) {
 +			char b[48];
 +			q2qt_hex(b, sizeof b, evs + i * Q2QT_EVENT_SIZE, 6);
@@ -1091,20 +1115,25 @@ index 0000000..34ee604
 +			}
 +			continue;
 +		}
++		if (o.ttype == 5u) {    /* palm: never a touch */
++			continue;
++		}
 +		uint32_t fx, fy;
 +		int32_t hx, hy;
-+		q2qt_raw_to_view(&qt.map, o.x, o.y, &fx, &fy);
-+		if (sweet_fb_touch_to_hid(fx, fy, &hx, &hy) < 0) {
-+			continue;   /* rotation off: no mapping */
++		q2qt_raw_to_view(&c->map, o.x, o.y, &fx, &fy);
++		int m = c->cover ? sweet_fb_touch_to_hid_cover(fx, fy, &hx, &hy) :
++		    sweet_fb_touch_to_hid(fx, fy, &hx, &hy);
++		if (m < 0) {
++			continue;   /* that panel is not presenting: no mapping */
 +		}
-+		if (!(*mask & bit) || hx != qt.hx[o.tid] || hy != qt.hy[o.tid]) {
++		if (!(*mask & bit) || hx != c->hx[o.tid] || hy != c->hy[o.tid]) {
 +			*changed = true;
 +		}
 +		*mask |= bit;
-+		qt.rx[o.tid] = o.x;
-+		qt.ry[o.tid] = o.y;
-+		qt.hx[o.tid] = hx;
-+		qt.hy[o.tid] = hy;
++		c->rx[o.tid] = o.x;
++		c->ry[o.tid] = o.y;
++		c->hx[o.tid] = hx;
++		c->hy[o.tid] = hy;
 +	}
 +	return (int)count;
 +}
@@ -1193,21 +1222,27 @@ index 0000000..34ee604
 +	if (qt.bb_us > 100) {
 +		qt.bb_us = 1;
 +	}
-+	qt.map.maxx = 4096;
-+	qt.map.maxy = 4096;
-+	(void)PE_parse_boot_argn("q2qtmx", &qt.map.maxx, sizeof(qt.map.maxx));
-+	(void)PE_parse_boot_argn("q2qtmy", &qt.map.maxy, sizeof(qt.map.maxy));
-+	(void)PE_parse_boot_argn("q2qtswap", &qt.map.swap, sizeof(qt.map.swap));
-+	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
-+	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
++	qt_in.map.maxx = qt_in.map.maxy = 4096;
++	(void)PE_parse_boot_argn("q2qtmx", &qt_in.map.maxx, sizeof(qt_in.map.maxx));
++	(void)PE_parse_boot_argn("q2qtmy", &qt_in.map.maxy, sizeof(qt_in.map.maxy));
++	(void)PE_parse_boot_argn("q2qtswap", &qt_in.map.swap, sizeof(qt_in.map.swap));
++	(void)PE_parse_boot_argn("q2qtfx", &qt_in.map.flipx, sizeof(qt_in.map.flipx));
++	(void)PE_parse_boot_argn("q2qtfy", &qt_in.map.flipy, sizeof(qt_in.map.flipy));
++	qt_cv.map.maxx = qt_cv.map.maxy = 4096;
++	(void)PE_parse_boot_argn("q2qtcmx", &qt_cv.map.maxx, sizeof(qt_cv.map.maxx));
++	(void)PE_parse_boot_argn("q2qtcmy", &qt_cv.map.maxy, sizeof(qt_cv.map.maxy));
++	(void)PE_parse_boot_argn("q2qtcswap", &qt_cv.map.swap, sizeof(qt_cv.map.swap));
++	(void)PE_parse_boot_argn("q2qtcfx", &qt_cv.map.flipx, sizeof(qt_cv.map.flipx));
++	(void)PE_parse_boot_argn("q2qtcfy", &qt_cv.map.flipy, sizeof(qt_cv.map.flipy));
++	int want_in = 1, want_cv = 1;
++	(void)PE_parse_boot_argn("q2qtinner", &want_in, sizeof(want_in));
++	(void)PE_parse_boot_argn("q2qtcover", &want_cv, sizeof(want_cv));
 +	qt_pm_bus.us = qt.i2c_us;
-+	/* Fold-at-boot: the shim hands XNU the panel ABL lit; the cover scans out upright. */
-+	PE_Video video;
-+	if (PE_current_console(&video) == 0 && video.v_width != 0 && video.v_width < video.v_height) {
-+		qt.cover = true;
-+	}
++	qt_in.int_pin = PIN_INT;
++	qt_cv.int_pin = PIN_CT_INT;
++	qt_cv.i2c = qt_cv.cover = true;
 +	sweet_fb_diag_stage = 1;
-+	qt_diag(DL_TITLE, qt.cover ? "Q2Q TOUCH V5 COVER" : "Q2Q TOUCH V5");
++	qt_diag(DL_TITLE, "Q2Q TOUCH V6 DUO");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
@@ -1223,108 +1258,120 @@ index 0000000..34ee604
 +		goto out;
 +	}
 +	sweet_fb_diag_stage = 3;
-+	if (qt.cover) {
-+		/* cover touch: s2mpb02 LDO8/LDO14, fts9cu59 at 0x49 on gpio72/73, IRQ gpio34 */
-+		qt.i2c = true;
-+		qt.int_pin = PIN_CT_INT;
-+		snprintf(b, sizeof b, "CT P%03X %03X %03X %X", qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SDA)) & 0x3ffu,
-+		    qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SCL)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_INT)) & 0x3ffu,
-+		    qt_rd(qt.tlmm, TLMM_IO(PIN_CT_INT)) & 3u);
++
++	/* ---- inner controller: SPI (bit-banged), s2dos05 power ---- */
++	if (want_in) {
++		qt_dl_off = 0;
++		qt.i2c = false;
++		qt_diag(DL_STEP, "STEP CLOCKS");
++		if (!qt_clocks()) {
++			sweet_fb_diag_stage = 92;
++			qt_diag(DL_STATE, "INNER: SE4 CLOCK OFF");
++			goto cover;
++		}
++		sweet_fb_diag_stage = 4;
++		qt_diag(DL_STEP, "STEP SE4");
++		if (!qt_se_setup(div)) {
++			sweet_fb_diag_stage = 93;
++			goto cover;
++		}
++		sweet_fb_diag_stage = 5;
++		qt_diag(DL_STEP, "STEP PINS");
++		snprintf(b, sizeof b, "P%03X %03X %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_MISO)) & 0x3ffu,
++		    qt_rd(qt.tlmm, TLMM_CFG(PIN_CS)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_INT)) & 0x3ffu,
++		    qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 3u);
 +		qt_diag(DL_PINS, b);
-+		qt_pin(PIN_CT_INT, 0, 0, 2, false, false);
-+		sweet_fb_diag_stage = 60;
-+		qt_diag(DL_STEP, "STEP POWER COVER");
-+		bool on = qt_power_cover();
-+		sweet_fb_diag_stage = on ? 61 : 62;
-+		qt_i2c_idle(&qt_ts_bus);
-+		qt_sleep_ms(200);
-+		goto chip;
-+	}
-+	qt.int_pin = PIN_INT;
-+	qt_diag(DL_STEP, "STEP CLOCKS");
-+	if (!qt_clocks()) {
-+		sweet_fb_diag_stage = 92;
-+		qt_diag(DL_STATE, "STOP: SE4 CLOCK OFF");
-+		goto out;
-+	}
-+	sweet_fb_diag_stage = 4;
-+	qt_diag(DL_STEP, "STEP SE4");
-+	if (!qt_se_setup(div)) {
-+		sweet_fb_diag_stage = 93;
-+		goto out;
-+	}
-+	sweet_fb_diag_stage = 5;
-+	qt_diag(DL_STEP, "STEP PINS");
-+	snprintf(b, sizeof b, "P%03X %03X %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_MISO)) & 0x3ffu,
-+	    qt_rd(qt.tlmm, TLMM_CFG(PIN_CS)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_INT)) & 0x3ffu,
-+	    qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 3u);
-+	qt_diag(DL_PINS, b);
-+	qt_pin(PIN_CS, 0, 0, 2, true, true);        /* CS idle high before the bus pins */
-+	if (qt.bb) {
-+		qt_pin(PIN_CLK, 0, 0, 6, true, false);  /* mode 0: clock idles low */
-+		qt_pin(PIN_MOSI, 0, 0, 6, true, false);
-+		qt_pin(PIN_MISO, 0, 0, 2, false, false);
-+	} else {
-+		qt_pin(PIN_MISO, 1, 0, 6, false, false);
-+		qt_pin(PIN_MOSI, 1, 0, 6, false, false);
-+		qt_pin(PIN_CLK, 1, 0, 6, false, false);
-+	}
-+	qt_pin(PIN_INT, 0, 0, 2, false, false);
-+	delay(100);
-+	sweet_fb_diag_stage = 6;
-+
-+	int pwr = 1;
-+	(void)PE_parse_boot_argn("q2qtpwr", &pwr, sizeof(pwr));
-+	if (pwr) {
-+		sweet_fb_diag_stage = 60;
-+		qt_diag(DL_STEP, "STEP POWER");
-+		bool on = qt_power();
-+		sweet_fb_diag_stage = on ? 61 : 62;
-+		qt_sleep_ms(200);      /* controller boot after power-up */
++		qt_pin(PIN_CS, 0, 0, 2, true, true);        /* CS idle high before the bus pins */
++		if (qt.bb) {
++			qt_pin(PIN_CLK, 0, 0, 6, true, false);  /* mode 0: clock idles low */
++			qt_pin(PIN_MOSI, 0, 0, 6, true, false);
++			qt_pin(PIN_MISO, 0, 0, 2, false, false);
++		} else {
++			qt_pin(PIN_MISO, 1, 0, 6, false, false);
++			qt_pin(PIN_MOSI, 1, 0, 6, false, false);
++			qt_pin(PIN_CLK, 1, 0, 6, false, false);
++		}
++		qt_pin(PIN_INT, 0, 0, 2, false, false);
++		delay(100);
++		sweet_fb_diag_stage = 6;
++		int pwr = 1;
++		(void)PE_parse_boot_argn("q2qtpwr", &pwr, sizeof(pwr));
++		if (pwr) {
++			sweet_fb_diag_stage = 60;
++			qt_diag(DL_STEP, "STEP POWER");
++			bool on = qt_power();
++			sweet_fb_diag_stage = on ? 61 : 62;
++			qt_sleep_ms(200);      /* controller boot after power-up */
++		}
++		qt_in.on = qt_chip_start();
++		qt_diag(DL_STATE, qt_in.on ? "INNER RUNNING" : "INNER: NO ANSWER ON SPI");
 +	}
 +
-+chip:
-+	if (!qt_chip_start()) {
++cover:
++	/* ---- cover controller: I2C (bit-banged), s2mpb02 power; only if iOS is mirrored there ---- */
++	{
++		int32_t tx, ty;
++		if (want_cv && sweet_fb_touch_to_hid_cover(0x8000u, 0x8000u, &tx, &ty) >= 0) {
++			qt_dl_off = 20;
++			qt.i2c = true;
++			qt_diag(DL_TITLE, "COVER TOUCH");
++			snprintf(b, sizeof b, "CT P%03X %03X %03X %X", qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SDA)) & 0x3ffu,
++			    qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SCL)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_INT)) & 0x3ffu,
++			    qt_rd(qt.tlmm, TLMM_IO(PIN_CT_INT)) & 3u);
++			qt_diag(DL_PINS, b);
++			qt_pin(PIN_CT_INT, 0, 0, 2, false, false);
++			qt_diag(DL_STEP, "STEP POWER COVER");
++			(void)qt_power_cover();
++			qt_i2c_idle(&qt_ts_bus);
++			qt_sleep_ms(200);
++			qt_cv.on = qt_chip_start();
++			qt_diag(DL_STATE, qt_cv.on ? "COVER RUNNING" : "COVER: NO ANSWER ON I2C");
++			qt_dl_off = 0;
++		}
++	}
++	if (!qt_in.on && !qt_cv.on) {
 +		sweet_fb_diag_stage = 94;
-+		qt_diag(DL_STATE, qt.i2c ? "STOP: NO ANSWER ON I2C" : "STOP: NO ANSWER ON SPI");
 +		goto out;
 +	}
 +	sweet_fb_diag_stage = 8;
-+	qt_diag(DL_STATE, "RUNNING - TOUCH SCREEN");
-+	uint32_t mask = 0, ticks = 0;
++
 +	uint64_t last_draw = 0;
 +	for (;;) {
-+		bool irq = !(qt_rd(qt.tlmm, TLMM_IO(qt.int_pin)) & 1u);   /* active low */
-+		bool changed = false;
-+		if (irq || mask || (++ticks % 10u) == 0) {
-+			int n = qt_poll(&mask, &changed);
-+			if (n < 0 && mask) {
-+				mask = 0;          /* bus trouble: release everything */
-+				changed = true;
-+			}
-+		}
-+		if (changed) {
-+			qt_report(mask);
-+		}
 +		uint64_t now = qt_now_us();
-+		if (changed || now - last_draw > 1000000u) {
-+			if (now - last_draw > 100000u) {
-+				last_draw = now;
-+				uint32_t f = 0;
-+				while (f < Q2QT_FINGERS && !(mask & (1u << f))) {
-+					f++;
-+				}
-+				if (f < Q2QT_FINGERS) {
-+					snprintf(b, sizeof b, "T%u RAW %u %u", f, qt.rx[f], qt.ry[f]);
-+					qt_diag(DL_RAW, b);
-+					snprintf(b, sizeof b, "HID %d %d", qt.hx[f], qt.hy[f]);
-+					qt_diag(DL_HID, b);
-+				} else {
-+					qt_diag(DL_HID, "HID UP");
-+				}
-+				snprintf(b, sizeof b, "EV%u X%u E%u I%u", qt.events, qt.xfers, qt.errors, irq ? 1 : 0);
-+				qt_diag(DL_COUNT, b);
++		struct qt_ctl *ctls[2] = { &qt_in, &qt_cv };
++		for (int k = 0; k < 2; k++) {
++			struct qt_ctl *c = ctls[k], *other = ctls[k ^ 1];
++			if (!c->on) {
++				continue;
 +			}
++			bool irq = !(qt_rd(qt.tlmm, TLMM_IO(c->int_pin)) & 1u);   /* active low */
++			bool changed = false;
++			if (irq || c->mask || (++c->ticks % 10u) == 0) {
++				int n = qt_poll(c, &changed);
++				if (n < 0 && c->mask) {
++					c->mask = 0;       /* bus trouble: release everything */
++					changed = true;
++				}
++			}
++			/* the side in use owns HID; the other side's contacts are ignored meanwhile */
++			bool blocked = other->on && (other->active != 0 ||
++			    (other->last_us != 0 && now - other->last_us < 3000000u));
++			uint32_t report = blocked ? 0 : c->mask;
++			if (c->mask) {
++				c->last_us = now;
++			}
++			if (changed || report != c->active) {
++				qt_report(c, report);
++			}
++		}
++		if (now - last_draw > 1000000u) {
++			last_draw = now;
++			snprintf(b, sizeof b, "IN EV%u A%X", qt_in.events, qt_in.active);
++			qt_diag(DL_RAW, b);
++			snprintf(b, sizeof b, "CV EV%u A%X", qt_cv.events, qt_cv.active);
++			qt_diag(DL_HID, b);
++			snprintf(b, sizeof b, "X%u E%u", qt.xfers, qt.errors);
++			qt_diag(DL_COUNT, b);
 +		}
 +		qt_sleep_ms(10);
 +	}

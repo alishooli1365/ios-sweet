@@ -10,7 +10,7 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -51,6 +51,490 @@
+@@ -51,6 +51,511 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -438,6 +438,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +static struct sweet_fb_rot sweet_fb_rot_state;
 +static bool sweet_fb_rot_cleared;
 +
++/*
++ * q2q "iPhone Duo": ABL leaves BOTH Fold3 panels scanning one buffer (stride 8832): the inner
++ * panel rows 0..1767 (2208 wide), the cover panel an 832x2268 window at row 1768 (SSPP 2/3,
++ * SRC_XY y=0x6E8). Every frame also goes, upright and scaled, into the cover window, so iOS
++ * shows on whichever side is in use. Boot-args: sweetfb_duo=0 off, sweetfb_cy/cw/ch window.
++ */
++static struct sweet_fb_rot sweet_fb_rot_cover;
++static uintptr_t sweet_fb_cover_pixels;
++static IOMemoryDescriptor *sweet_fb_cover_md;
++static IOMemoryMap *sweet_fb_cover_map;
++
 +/* q2q: diagnostic lines in the left bar (kept, redrawn after the first clear). */
 +#define SWEET_DIAG_MAX_LINES 96
 +static char sweet_fb_diag_text[SWEET_DIAG_MAX_LINES][40];
@@ -498,10 +509,20 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	return sweet_fb_rot_view_to_hid(&sweet_fb_rot_state, fx16, fy16, hx, hy);
 +}
 +
++/* q2q cover touch: fractions of the cover panel -> 1080x2400 (-1 when the mirror is off). */
++extern "C" int
++sweet_fb_touch_to_hid_cover(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy)
++{
++	if (sweet_fb_cover_pixels == 0) {
++		return -1;
++	}
++	return sweet_fb_rot_view_to_hid(&sweet_fb_rot_cover, fx16, fy16, hx, hy);
++}
++
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -176,6 +660,22 @@
+@@ -176,6 +681,46 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -521,10 +542,34 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			IOLog("SWEET FB: sweetfb_rot=%u not usable, unrotated\n", rot);
 +		}
 +	}
++	uint32_t duo = 1, cy = fHeight, cw = 832, ch = 2268;
++	(void)PE_parse_boot_argn("sweetfb_duo", &duo, sizeof(duo));
++	(void)PE_parse_boot_argn("sweetfb_cy", &cy, sizeof(cy));
++	(void)PE_parse_boot_argn("sweetfb_cw", &cw, sizeof(cw));
++	(void)PE_parse_boot_argn("sweetfb_ch", &ch, sizeof(ch));
++	if (duo && sweet_fb_rot_state.rot != 0 && fWidth > fHeight && cw != 0 && ch != 0 &&
++	    (uint64_t)cw * 4 <= fRowBytes) {
++		uint64_t cpa = fPhys + (uint64_t)cy * fRowBytes;
++		/* task NULL: a physical range (64-bit; IOPhysicalAddress may be 32-bit) */
++		sweet_fb_cover_md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)cpa,
++		    (mach_vm_size_t)ch * fRowBytes, kIODirectionInOut, NULL);
++		sweet_fb_cover_map = sweet_fb_cover_md != NULL ?
++		    sweet_fb_cover_md->map(kIOMapWriteCombineCache) : NULL;
++		if (sweet_fb_cover_map != NULL &&
++		    sweet_fb_rot_setup(&sweet_fb_rot_cover, 2, cw, ch, fRowBytes, fLogicalW, fLogicalH)) {
++			sweet_fb_cover_pixels = (uintptr_t)sweet_fb_cover_map->getVirtualAddress();
++			IOLog("SWEET FB: duo: cover %ux%u at 0x%llx (row %u), image %ux%u at %u,%u\n", cw, ch,
++			    cpa, cy, sweet_fb_rot_cover.dw, sweet_fb_rot_cover.dh, sweet_fb_rot_cover.ox,
++			    sweet_fb_rot_cover.oy);
++		} else {
++			sweet_fb_rot_cover.rot = 0;
++			IOLog("SWEET FB: duo: cover mapping failed\n");
++		}
++	}
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -212,6 +712,9 @@
+@@ -212,6 +757,9 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -534,7 +579,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -359,6 +862,41 @@
+@@ -359,6 +907,48 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -559,6 +604,9 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				if (!sweet_fb_rot_cleared) {
 +					sweet_fb_rot_cleared = true;
 +					sweet_fb_rot_clear(&sweet_fb_rot_state, fPixels);
++					if (sweet_fb_cover_pixels != 0) {
++						sweet_fb_rot_clear(&sweet_fb_rot_cover, sweet_fb_cover_pixels);
++					}
 +					sweet_fb_diag_pixels = fPixels;
 +					for (uint32_t dl = 0; sweet_fb_diag_on && dl < SWEET_DIAG_MAX_LINES; dl++) {
 +						if (sweet_fb_diag_text[dl][0] != '\0') {
@@ -569,6 +617,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				}
 +				sweet_fb_rot_copy(&sweet_fb_rot_state, fPixels, src + s->offset,
 +				    s->bytesPerRow, sx, sy, dx, dy, w, h);
++				if (sweet_fb_cover_pixels != 0) {   /* q2q duo: the cover window too */
++					sweet_fb_rot_copy(&sweet_fb_rot_cover, sweet_fb_cover_pixels, src + s->offset,
++					    s->bytesPerRow, sx, sy, dx, dy, w, h);
++				}
 +			}
 +			s->release();
 +			continue;
