@@ -1,0 +1,884 @@
+From: q2q port
+Subject: [PATCH] q2q: Fold3 inner touchscreen (STM FTS9CU80F on SPI SE4)
+
+Polled driver for the Galaxy Z Fold3 inner touch controller: GCC votes and TCXO root for
+QUP wrapper-0 SE4, FIFO-mode GENI SPI (mode 0, GPIO23 chip select), FTS chip id / reset /
+scan-on, 16-byte event decoding, and sweet_hid_touch() reports mapped through the rotated
+presentation (patch 0903). Progress is drawn in the left black bar. Boot-args: q2qtouch,
+q2qtouchdelay, q2qtouchdiv, q2qtmx, q2qtmy, q2qtswap, q2qtfx, q2qtfy.
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6630131..ea13696 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
++bsd/dev/q2q_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
+new file mode 100644
+index 0000000..32bc941
+--- /dev/null
++++ b/bsd/dev/q2q_touch.c
+@@ -0,0 +1,836 @@
++/*
++ * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
++ *
++ * STMicro FTS9CU80F on QUP wrapper-0 serial engine 4 (SPI, 0x990000), chip select on GPIO23
++ * (driven as a plain GPIO, like Samsung's driver), interrupt line GPIO165 (used as a hint;
++ * the event FIFO is polled). Power comes from the display PMIC's s2dos05 LDO2/LDO3, which the
++ * bootloader leaves on with the panel ("regulator-boot-on"), so no PMIC writes here.
++ *
++ * Steps, each announced on the diagnostic lines in the left black bar BEFORE it runs, so a hang
++ * shows where it stopped:
++ *   clocks (GCC votes for wrapper-0 AHB/core and SE4, SE4 root on TCXO 19.2 MHz)
++ *   -> serial engine checks (SPI firmware, FIFO) -> FIFO-mode SPI setup -> pins
++ *   -> chip id -> system reset -> scan on -> poll events -> sweet_hid_touch().
++ * Boot-args: q2qtouch=0 off; q2qtouchdelay=<s> (20); q2qtouchdiv=<n> SPI clock 19.2 MHz / n (4);
++ *   q2qtmx/q2qtmy raw range (4096); q2qtswap, q2qtfx, q2qtfy orientation fixes.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_fb_diag(unsigned line, const char *text);
++extern int sweet_fb_touch_to_hid(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy);
++void q2q_touch_init(void);
++
++/*
++ * q2q (Galaxy Z Fold3) inner touch: hardware-independent pieces, shared by the kernel driver
++ * (q2q_touch.c) and the host test. STMicro FTS9CU80F on SPI, protocol facts taken from
++ * Samsung's GPL driver (drivers/input/touchscreen/stm/fts9cu80f_spi):
++ *  - a write of a "raw" command (A0 A2 A4 A7 FA FB) is sent as is; any other command gets a
++ *    C0 prefix;
++ *  - a read of 87 / A7 / A4 / FA / FB sends the command bytes, one turnaround byte, then the
++ *    data; any other register is first written (C0 prefix), then read with D1 + 2 address
++ *    bytes, one turnaround byte, then the data;
++ *  - events are 16 bytes: byte0 = event id (bits 0-1), touch id (2-5), action (6-7);
++ *    x = byte1 << 4 | byte3 >> 4, y = byte2 << 4 | byte3 & 15; byte7 bits 0-4 = events left.
++ */
++#define Q2QT_EVENT_SIZE   16u
++#define Q2QT_FIFO_MAX     31u
++#define Q2QT_FINGERS      10u
++
++enum { Q2QT_EV_NONE = 0, Q2QT_EV_TOUCH, Q2QT_EV_STATUS, Q2QT_EV_ERROR, Q2QT_EV_OTHER };
++enum { Q2QT_ACT_NONE = 0, Q2QT_ACT_PRESS, Q2QT_ACT_MOVE, Q2QT_ACT_RELEASE };
++
++struct q2qt_ev {
++	uint32_t kind, tid, action, x, y, ttype, left, stype, status_id;
++};
++
++static int
++q2qt_raw_cmd(uint8_t c)
++{
++	return c == 0xA0 || c == 0xA2 || c == 0xA4 || c == 0xA7 || c == 0xFA || c == 0xFB;
++}
++
++/* Frame for a register/command write. Returns the frame length (0 if it does not fit). */
++static uint32_t
++q2qt_frame_write(const uint8_t *cmd, uint32_t n, uint8_t *tx, uint32_t cap)
++{
++	uint32_t off = q2qt_raw_cmd(cmd[0]) ? 0 : 1;
++	if (n == 0 || n + off > cap) {
++		return 0;
++	}
++	if (off) {
++		tx[0] = 0xC0;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		tx[off + i] = cmd[i];
++	}
++	return n + off;
++}
++
++/*
++ * Frame for a read of rlen bytes. *pre is set when the register must first be written with
++ * q2qt_frame_write(reg, tlen). Returns the full-duplex length; the data starts at *data_off.
++ */
++static uint32_t
++q2qt_frame_read(const uint8_t *reg, uint32_t tlen, uint32_t rlen, uint8_t *tx, uint32_t cap,
++    uint32_t *data_off, int *pre)
++{
++	uint32_t hdr;
++	uint8_t c = reg[0];
++	if (tlen == 0) {
++		return 0;
++	}
++	if (c == 0x87 || c == 0xA7 || c == 0xA4 || c == 0xFA || c == 0xFB) {
++		hdr = tlen;
++		*pre = 0;
++	} else {
++		if (tlen > 3) {
++			return 0;
++		}
++		hdr = 3;
++		*pre = 1;
++	}
++	if (hdr + 1 + rlen > cap) {
++		return 0;
++	}
++	for (uint32_t i = 0; i < hdr + 1 + rlen; i++) {
++		tx[i] = 0;
++	}
++	if (*pre) {
++		tx[0] = 0xD1;
++		tx[1] = tlen == 3 ? reg[1] : 0x00;
++		tx[2] = tlen == 1 ? 0x00 : reg[0];
++	} else {
++		for (uint32_t i = 0; i < tlen; i++) {
++			tx[i] = reg[i];
++		}
++	}
++	*data_off = hdr + 1;
++	return hdr + 1 + rlen;
++}
++
++static void
++q2qt_parse(const uint8_t *e, struct q2qt_ev *o)
++{
++	o->kind = Q2QT_EV_OTHER;
++	o->tid = (e[0] >> 2) & 15u;
++	o->action = e[0] >> 6;
++	o->x = ((uint32_t)e[1] << 4) | (e[3] >> 4);
++	o->y = ((uint32_t)e[2] << 4) | (e[3] & 15u);
++	o->ttype = (((uint32_t)e[6] >> 6) << 2) | (e[7] >> 6);
++	o->left = e[7] & 0x1fu;
++	o->stype = (e[0] >> 2) & 15u;
++	o->status_id = e[1];
++	int zero = 1;
++	for (uint32_t i = 0; i < Q2QT_EVENT_SIZE; i++) {
++		if (e[i] != 0) {
++			zero = 0;
++		}
++	}
++	if (zero) {
++		o->kind = Q2QT_EV_NONE;
++		o->left = 0;
++	} else if (e[0] == 0xF3) {
++		o->kind = Q2QT_EV_ERROR;
++	} else if ((e[0] & 3u) == 0) {
++		o->kind = (o->action == Q2QT_ACT_NONE || o->tid >= Q2QT_FINGERS) ?
++		    Q2QT_EV_OTHER : Q2QT_EV_TOUCH;
++	} else if ((e[0] & 3u) == 1) {
++		o->kind = Q2QT_EV_STATUS;
++	}
++}
++
++/* "Ready" status after a system reset: status event, information type (2), id 0. */
++static int
++q2qt_is_ready(const struct q2qt_ev *o)
++{
++	return o->kind == Q2QT_EV_STATUS && o->stype == 2 && o->status_id == 0;
++}
++
++/* Raw controller coordinates -> fractions (1/65536) of the upright view. */
++struct q2qt_map {
++	uint32_t maxx, maxy;   /* raw range (exclusive) */
++	int swap, flipx, flipy;
++};
++
++static void
++q2qt_raw_to_view(const struct q2qt_map *m, uint32_t x, uint32_t y, uint32_t *fx16, uint32_t *fy16)
++{
++	uint32_t a = m->swap ? y : x, b = m->swap ? x : y;
++	uint32_t ma = m->swap ? m->maxy : m->maxx, mb = m->swap ? m->maxx : m->maxy;
++	if (ma == 0) {
++		ma = 1;
++	}
++	if (mb == 0) {
++		mb = 1;
++	}
++	if (a >= ma) {
++		a = ma - 1;
++	}
++	if (b >= mb) {
++		b = mb - 1;
++	}
++	uint64_t fa = ((uint64_t)a << 16) / ma, fb = ((uint64_t)b << 16) / mb;
++	if (m->flipx) {
++		fa = 0xffffu - fa;
++	}
++	if (m->flipy) {
++		fb = 0xffffu - fb;
++	}
++	*fx16 = (uint32_t)fa;
++	*fy16 = (uint32_t)fb;
++}
++
++/* GENI FIFO words: 4 bytes per word, first byte in bits 7:0. */
++static uint32_t
++q2qt_pack(const uint8_t *b, uint32_t n)
++{
++	uint32_t w = 0;
++	for (uint32_t i = 0; i < n && i < 4; i++) {
++		w |= (uint32_t)b[i] << (8 * i);
++	}
++	return w;
++}
++
++static void
++q2qt_unpack(uint32_t w, uint8_t *b, uint32_t n)
++{
++	for (uint32_t i = 0; i < n && i < 4; i++) {
++		b[i] = (uint8_t)(w >> (8 * i));
++	}
++}
++
++/* Upper-case hex of n bytes, space separated, into out (cap includes the NUL). */
++static void
++q2qt_hex(char *out, uint32_t cap, const uint8_t *b, uint32_t n)
++{
++	static const char hx[] = "0123456789ABCDEF";
++	uint32_t o = 0;
++	for (uint32_t i = 0; i < n && o + 3 < cap; i++) {
++		if (i) {
++			out[o++] = ' ';
++		}
++		out[o++] = hx[b[i] >> 4];
++		out[o++] = hx[b[i] & 15u];
++	}
++	if (cap) {
++		out[o < cap ? o : cap - 1] = '\0';
++	}
++}
++
++#define GCC_PA          0x00100000u
++#define GCC_SIZE        0x00060000u
++#define GCC_VOTE        0x52008u          /* APCS clock branch enable vote */
++#define GCC_VOTE_BITS   ((1u << 6) | (1u << 7) | (1u << 8) | (1u << 9) | (1u << 14))
++#define GCC_S4_CBCR     0x174ccu          /* qupv3_wrap0_s4 branch */
++#define GCC_S4_RCG      0x174d0u          /* its root: CMD, CFG at +4 */
++#define GCC_CORE_CBCR   0x23000u
++#define GCC_CORE2X_CBCR 0x23008u
++#define CBCR_OFF        (1u << 31)
++
++#define TLMM_PA         0x0f100000u
++#define TLMM_SIZE       0x000b0000u       /* GPIO 0..175 */
++#define TLMM_CFG(n)     ((uint32_t)(n) * 0x1000u)
++#define TLMM_IO(n)      (TLMM_CFG(n) + 4u)
++#define PIN_MOSI        21u
++#define PIN_MISO        20u
++#define PIN_CLK         22u
++#define PIN_CS          23u
++#define PIN_INT         165u
++
++#define SE_PA           0x00990000u
++#define SE_SIZE         0x4000u
++#define SE_FORCE_DEF    0x020u
++#define SE_OUTPUT_CTRL  0x024u
++#define SE_CGC_CTRL     0x028u
++#define SE_STATUS       0x040u
++#define SE_M_CLK_CFG    0x048u
++#define SE_IF_DISABLE   0x064u
++#define SE_FW_REV       0x068u
++#define SE_CLK_SEL      0x07cu
++#define SE_SPI_CPHA     0x224u
++#define SE_SPI_LOOPBACK 0x22cu
++#define SE_SPI_CPOL     0x230u
++#define SE_SPI_DMX_INV  0x24cu
++#define SE_SPI_DMX_SEL  0x250u
++#define SE_BYTE_GRAN    0x254u
++#define SE_DMA_MODE     0x258u
++#define SE_SPI_TRANS    0x25cu
++#define SE_TX_PACK0     0x260u
++#define SE_TX_PACK1     0x264u
++#define SE_SPI_WORD_LEN 0x268u
++#define SE_SPI_TX_LEN   0x26cu
++#define SE_SPI_RX_LEN   0x270u
++#define SE_RX_PACK0     0x284u
++#define SE_RX_PACK1     0x288u
++#define SE_M_CMD0       0x600u
++#define SE_M_CMD_CTRL   0x604u
++#define SE_M_IRQ        0x610u
++#define SE_M_IRQ_EN     0x614u
++#define SE_M_IRQ_CLR    0x618u
++#define SE_S_IRQ_CLR    0x648u
++#define SE_TX_FIFO      0x700u
++#define SE_RX_FIFO      0x780u
++#define SE_TX_STATUS    0x800u
++#define SE_RX_STATUS    0x804u
++#define SE_TX_WM        0x80cu
++#define SE_RX_WM        0x810u
++#define SE_RX_RFR       0x814u
++#define SE_GSI_EVT      0xe18u
++#define SE_IRQ_ROUTE    0xe1cu
++#define SE_HW_PARAM0    0xe24u
++#define SE_DMA_GEN_CFG  0xe30u
++#define M_DONE          (1u << 0)
++#define M_ERRORS        (0x3eu)            /* overrun, illegal, failure, cancel, abort */
++#define M_CANCEL_DONE   (1u << 4)
++#define M_ABORT_DONE    (1u << 5)
++#define SPI_FULL_DUPLEX 3u
++#define GENI_PROTO_SPI  1u
++
++#define DL_TITLE  0
++#define DL_STEP   1
++#define DL_CLK    2
++#define DL_SE     3
++#define DL_FIFO   4
++#define DL_PINS   5
++#define DL_ID     6
++#define DL_HWID   7
++#define DL_RESET  8
++#define DL_EV0    9
++#define DL_SCAN   10
++#define DL_STATE  11
++#define DL_RAW    12
++#define DL_HID    13
++#define DL_COUNT  14
++#define DL_ERR    15
++
++static struct {
++	vm_offset_t gcc, tlmm, se;
++	uint32_t depth;           /* FIFO words */
++	bool started;
++	uint32_t active;          /* finger bit mask reported down */
++	int32_t hx[Q2QT_FINGERS], hy[Q2QT_FINGERS];
++	uint32_t rx[Q2QT_FINGERS], ry[Q2QT_FINGERS];
++	struct q2qt_map map;
++	uint32_t errors, events, xfers;
++} qt;
++static int qt_sleep_chan;
++
++static uint32_t
++qt_rd(vm_offset_t b, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(b + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++qt_wr(vm_offset_t b, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(b + off) = v;
++	__asm__ volatile ("dsb osh" ::: "memory");
++}
++
++static void
++qt_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&qt_sleep_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++qt_diag(unsigned line, const char *text)
++{
++	sweet_fb_diag(line, text);
++	printf("Q2Q TOUCH: %s\n", text);
++}
++
++static uint64_t
++qt_now_us(void)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	return ns / 1000u;
++}
++
++/* TLMM: function mux, pull (0 none, 1 down, 3 up), drive in mA, output enable + level. */
++static void
++qt_pin(uint32_t pin, uint32_t func, uint32_t pull, uint32_t ma, bool out, bool level)
++{
++	uint32_t cfg = qt_rd(qt.tlmm, TLMM_CFG(pin));
++	if (out) {
++		uint32_t io = qt_rd(qt.tlmm, TLMM_IO(pin));
++		qt_wr(qt.tlmm, TLMM_IO(pin), level ? (io | 2u) : (io & ~2u));
++	}
++	cfg &= ~0x3ffu;
++	cfg |= pull | (func << 2) | (((ma / 2u) - 1u) << 6) | (out ? (1u << 9) : 0u);
++	qt_wr(qt.tlmm, TLMM_CFG(pin), cfg);
++}
++
++static void
++qt_cs(bool high)
++{
++	uint32_t io = qt_rd(qt.tlmm, TLMM_IO(PIN_CS));
++	qt_wr(qt.tlmm, TLMM_IO(PIN_CS), high ? (io | 2u) : (io & ~2u));
++}
++
++static bool
++qt_clocks(void)
++{
++	char b[48];
++	uint32_t vote = qt_rd(qt.gcc, GCC_VOTE);
++	uint32_t s4 = qt_rd(qt.gcc, GCC_S4_CBCR), cfg = qt_rd(qt.gcc, GCC_S4_RCG + 4u);
++	snprintf(b, sizeof b, "V%05X S%08X", vote & 0xfffffu, s4);
++	qt_diag(DL_CLK, b);
++	qt_wr(qt.gcc, GCC_VOTE, vote | GCC_VOTE_BITS);
++	/* SE4 root: TCXO (source 0), no divider, no M/N; then latch it. */
++	qt_wr(qt.gcc, GCC_S4_RCG + 4u, 0);
++	qt_wr(qt.gcc, GCC_S4_RCG, qt_rd(qt.gcc, GCC_S4_RCG) | 1u);
++	bool latched = false;
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(qt_rd(qt.gcc, GCC_S4_RCG) & 1u)) {
++			latched = true;
++			break;
++		}
++		delay(1);
++	}
++	bool on = false;
++	for (unsigned i = 0; i < 1000; i++) {
++		if (!(qt_rd(qt.gcc, GCC_S4_CBCR) & CBCR_OFF) &&
++		    !(qt_rd(qt.gcc, GCC_CORE_CBCR) & CBCR_OFF)) {
++			on = true;
++			break;
++		}
++		delay(1);
++	}
++	snprintf(b, sizeof b, "CLK %s RCG%s C%X", on ? "ON" : "OFF", latched ? "OK" : "TO",
++	    cfg & 0xffffu);
++	qt_diag(DL_CLK, b);
++	return on && latched;
++}
++
++static bool
++qt_se_setup(unsigned div)
++{
++	char b[48];
++	uint32_t fw = qt_rd(qt.se, SE_FW_REV), hw = qt_rd(qt.se, SE_HW_PARAM0);
++	uint32_t ifd = qt_rd(qt.se, SE_IF_DISABLE), st = qt_rd(qt.se, SE_STATUS);
++	uint32_t proto = (fw >> 8) & 0xffu, width = (hw >> 24) & 0x3fu;
++	qt.depth = (hw >> 16) & 0x3fu;
++	snprintf(b, sizeof b, "SE FW%04X P%u S%X", fw & 0xffffu, proto, st & 0xfffu);
++	qt_diag(DL_SE, b);
++	snprintf(b, sizeof b, "FIFO D%u W%u IF%u", qt.depth, width, ifd & 1u);
++	qt_diag(DL_FIFO, b);
++	if (proto != GENI_PROTO_SPI || width != 32u || qt.depth < 4u || (ifd & 1u)) {
++		qt_diag(DL_STATE, "STOP: SE4 NOT SPI FIFO");
++		return false;
++	}
++	if (st & 1u) {
++		qt_diag(DL_STATE, "STOP: SE4 BUSY");
++		return false;
++	}
++	qt_wr(qt.se, SE_GSI_EVT, 0);
++	qt_wr(qt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	qt_wr(qt.se, SE_S_IRQ_CLR, 0xffffffffu);
++	qt_wr(qt.se, SE_IRQ_ROUTE, 0);          /* nothing to the GIC: polled */
++	qt_wr(qt.se, SE_CGC_CTRL, qt_rd(qt.se, SE_CGC_CTRL) | 0x7fu);
++	qt_wr(qt.se, SE_DMA_GEN_CFG, qt_rd(qt.se, SE_DMA_GEN_CFG) | 0x0fu);
++	qt_wr(qt.se, SE_OUTPUT_CTRL, 0x7fu);
++	qt_wr(qt.se, SE_FORCE_DEF, 1u);
++	qt_wr(qt.se, SE_DMA_MODE, 0);           /* FIFO mode */
++	qt_wr(qt.se, SE_TX_WM, 0);
++	qt_wr(qt.se, SE_RX_WM, 0);
++	qt_wr(qt.se, SE_RX_RFR, qt.depth - 2u);
++	qt_wr(qt.se, SE_M_IRQ_EN, M_DONE | M_ERRORS | (1u << 26) | (1u << 27) | (1u << 30));
++	/* SPI mode 0, chip select 0 (unused: CS is GPIO23), 8-bit words, MSB first. */
++	qt_wr(qt.se, SE_SPI_LOOPBACK, 0);
++	qt_wr(qt.se, SE_SPI_DMX_SEL, 0);
++	qt_wr(qt.se, SE_SPI_CPHA, 0);
++	qt_wr(qt.se, SE_SPI_CPOL, 0);
++	qt_wr(qt.se, SE_SPI_DMX_INV, 0);
++	qt_wr(qt.se, SE_SPI_WORD_LEN, 8u - 4u);
++	qt_wr(qt.se, SE_TX_PACK0, 0x0007f8feu);
++	qt_wr(qt.se, SE_TX_PACK1, 0x000ffefeu);
++	qt_wr(qt.se, SE_RX_PACK0, 0x0007f8feu);
++	qt_wr(qt.se, SE_RX_PACK1, 0x000ffefeu);
++	qt_wr(qt.se, SE_BYTE_GRAN, 0);
++	qt_wr(qt.se, SE_SPI_TRANS, qt_rd(qt.se, SE_SPI_TRANS) & ~2u);   /* no CS toggle */
++	qt_wr(qt.se, SE_CLK_SEL, 0);
++	qt_wr(qt.se, SE_M_CLK_CFG, (div << 4) | 1u);
++	return true;
++}
++
++/* One full-duplex SPI transfer of n bytes with CS (GPIO23) held low. */
++static int
++qt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
++{
++	uint32_t ti = 0, ri = 0, irq = 0;
++	int err = 0;
++	qt.xfers++;
++	qt_cs(false);
++	qt_wr(qt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	qt_wr(qt.se, SE_SPI_TX_LEN, n);
++	qt_wr(qt.se, SE_SPI_RX_LEN, n);
++	qt_wr(qt.se, SE_M_CMD0, SPI_FULL_DUPLEX << 27);
++	uint64_t t0 = qt_now_us();
++	for (;;) {
++		uint32_t used = qt_rd(qt.se, SE_TX_STATUS) & 0x0fffffffu;
++		while (ti < n && used < qt.depth) {
++			uint32_t k = n - ti < 4u ? n - ti : 4u;
++			qt_wr(qt.se, SE_TX_FIFO, q2qt_pack(tx + ti, k));
++			ti += k;
++			used++;
++		}
++		uint32_t words = qt_rd(qt.se, SE_RX_STATUS) & 0x01ffffffu;
++		while (words-- > 0) {
++			uint32_t w = qt_rd(qt.se, SE_RX_FIFO);
++			if (ri < n) {
++				uint32_t k = n - ri < 4u ? n - ri : 4u;
++				q2qt_unpack(w, rx + ri, k);
++				ri += k;
++			}
++		}
++		irq = qt_rd(qt.se, SE_M_IRQ);
++		if (irq & M_ERRORS) {
++			err = EIO;
++			break;
++		}
++		if ((irq & M_DONE) && ri >= n) {
++			break;
++		}
++		if (qt_now_us() - t0 > 20000u) {
++			err = ETIMEDOUT;
++			break;
++		}
++	}
++	if (err) {
++		/* Cancel, then abort, the command so the engine is idle for the next one. */
++		qt_wr(qt.se, SE_M_CMD_CTRL, 1u << 2);
++		for (unsigned i = 0; i < 1000 && !(qt_rd(qt.se, SE_M_IRQ) & (M_CANCEL_DONE | M_DONE)); i++) {
++			delay(1);
++		}
++		if (qt_rd(qt.se, SE_STATUS) & 1u) {
++			qt_wr(qt.se, SE_M_CMD_CTRL, 1u << 1);
++			for (unsigned i = 0; i < 1000 && !(qt_rd(qt.se, SE_M_IRQ) & M_ABORT_DONE); i++) {
++				delay(1);
++			}
++		}
++		for (unsigned i = 0; i < 64 && (qt_rd(qt.se, SE_RX_STATUS) & 0x01ffffffu); i++) {
++			(void)qt_rd(qt.se, SE_RX_FIFO);
++		}
++		if ((qt.errors++ % 50u) == 0) {
++			char b[48];
++			snprintf(b, sizeof b, "XFER %s IRQ%08X", err == EIO ? "ERR" : "TO", irq);
++			qt_diag(DL_ERR, b);
++		}
++	}
++	qt_wr(qt.se, SE_M_IRQ_CLR, 0xffffffffu);
++	qt_cs(true);
++	delay(5);
++	return err;
++}
++
++static uint8_t qt_tx[2 + Q2QT_FIFO_MAX * Q2QT_EVENT_SIZE + 8];
++static uint8_t qt_rxb[sizeof(qt_tx)];
++
++static int
++qt_write(const uint8_t *cmd, uint32_t n)
++{
++	uint32_t len = q2qt_frame_write(cmd, n, qt_tx, sizeof(qt_tx));
++	return len ? qt_xfer(qt_tx, qt_rxb, len) : EINVAL;
++}
++
++static int
++qt_read(const uint8_t *reg, uint32_t tlen, uint8_t *out, uint32_t rlen)
++{
++	uint32_t off = 0;
++	int pre = 0;
++	uint32_t len = q2qt_frame_read(reg, tlen, rlen, qt_tx, sizeof(qt_tx), &off, &pre);
++	if (len == 0) {
++		return EINVAL;
++	}
++	if (pre) {
++		uint8_t w[8];
++		uint32_t wl = q2qt_frame_write(reg, tlen, w, sizeof(w));
++		int e = wl ? qt_xfer(w, qt_rxb, wl) : EINVAL;
++		if (e) {
++			return e;
++		}
++		(void)q2qt_frame_read(reg, tlen, rlen, qt_tx, sizeof(qt_tx), &off, &pre);
++	}
++	int err = qt_xfer(qt_tx, qt_rxb, len);
++	if (!err) {
++		for (uint32_t i = 0; i < rlen; i++) {
++			out[i] = qt_rxb[off + i];
++		}
++	}
++	return err;
++}
++
++static void
++qt_report(uint32_t mask)
++{
++	for (uint32_t id = 0; id < Q2QT_FINGERS; id++) {
++		uint32_t bit = 1u << id;
++		if (mask & bit) {
++			sweet_hid_touch((int)id, 1, qt.hx[id], qt.hy[id]);
++		} else if (qt.active & bit) {
++			sweet_hid_touch((int)id, 0, qt.hx[id], qt.hy[id]);
++		}
++	}
++	qt.active = mask;
++}
++
++/* Read all pending events; returns the number of events read, or -errno. */
++static int
++qt_poll(uint32_t *mask, bool *changed)
++{
++	static uint8_t evs[Q2QT_FIFO_MAX * Q2QT_EVENT_SIZE];
++	const uint8_t cmd = 0x87;
++	int err = qt_read(&cmd, 1, evs, Q2QT_EVENT_SIZE);
++	if (err) {
++		return -err;
++	}
++	struct q2qt_ev o;
++	q2qt_parse(evs, &o);
++	if (o.kind == Q2QT_EV_NONE) {
++		return 0;
++	}
++	uint32_t count = 1 + (o.left < Q2QT_FIFO_MAX ? o.left : Q2QT_FIFO_MAX - 1u);
++	if (count > 1) {
++		err = qt_read(&cmd, 1, evs + Q2QT_EVENT_SIZE, (count - 1) * Q2QT_EVENT_SIZE);
++		if (err) {
++			count = 1;
++		}
++	}
++	for (uint32_t i = 0; i < count; i++) {
++		q2qt_parse(evs + i * Q2QT_EVENT_SIZE, &o);
++		qt.events++;
++		if (o.kind == Q2QT_EV_ERROR) {
++			char b[48];
++			q2qt_hex(b, sizeof b, evs + i * Q2QT_EVENT_SIZE, 6);
++			qt_diag(DL_ERR, b);
++			continue;
++		}
++		if (o.kind != Q2QT_EV_TOUCH) {
++			continue;
++		}
++		uint32_t bit = 1u << o.tid;
++		if (o.action == Q2QT_ACT_RELEASE) {
++			if (*mask & bit) {
++				*mask &= ~bit;
++				*changed = true;
++			}
++			continue;
++		}
++		uint32_t fx, fy;
++		int32_t hx, hy;
++		q2qt_raw_to_view(&qt.map, o.x, o.y, &fx, &fy);
++		if (sweet_fb_touch_to_hid(fx, fy, &hx, &hy) < 0) {
++			continue;   /* rotation off: no mapping */
++		}
++		if (!(*mask & bit) || hx != qt.hx[o.tid] || hy != qt.hy[o.tid]) {
++			*changed = true;
++		}
++		*mask |= bit;
++		qt.rx[o.tid] = o.x;
++		qt.ry[o.tid] = o.y;
++		qt.hx[o.tid] = hx;
++		qt.hy[o.tid] = hy;
++	}
++	return (int)count;
++}
++
++static bool
++qt_chip_start(void)
++{
++	char b[48], h[40];
++	uint8_t id[5] = {0}, hw[8] = {0}, ev[Q2QT_EVENT_SIZE];
++	const uint8_t rid = 0x22, rhw[5] = {0xFB, 0x20, 0x00, 0x00, 0x00};
++	const uint8_t reset[6] = {0xFA, 0x20, 0x00, 0x00, 0x24, 0x81};
++	const uint8_t ttype[3] = {0x30, 0x00, 0x61}, clr = 0x62, scan[3] = {0xA0, 0x00, 0x01};
++	const uint8_t inten[3] = {0xA4, 0x01, 0x01}, rev = 0x87;
++	struct q2qt_ev o;
++
++	qt_diag(DL_STEP, "STEP CHIP ID");
++	int e = qt_read(&rid, 1, id, sizeof(id));
++	q2qt_hex(h, sizeof h, id, 5);
++	snprintf(b, sizeof b, "ID%s %s", e ? "ERR" : "", h);
++	qt_diag(DL_ID, b);
++	e = qt_read(rhw, 5, hw, sizeof(hw));
++	q2qt_hex(h, sizeof h, hw, 6);
++	snprintf(b, sizeof b, "HW%s %s", e ? "ERR" : "", h);
++	qt_diag(DL_HWID, b);
++
++	qt_diag(DL_STEP, "STEP RESET");
++	(void)qt_write(reset, sizeof(reset));
++	qt_sleep_ms(30);
++	bool ready = false;
++	unsigned tries = 0;
++	for (; tries < 60 && !ready; tries++) {
++		if (qt_read(&rev, 1, ev, sizeof(ev)) == 0) {
++			q2qt_parse(ev, &o);
++			if (o.kind != Q2QT_EV_NONE) {
++				q2qt_hex(h, sizeof h, ev, 6);
++				qt_diag(DL_EV0, h);
++			}
++			ready = q2qt_is_ready(&o);
++		}
++		if (!ready) {
++			qt_sleep_ms(20);
++		}
++	}
++	snprintf(b, sizeof b, "RESET %s %u", ready ? "READY" : "NO READY", tries);
++	qt_diag(DL_RESET, b);
++
++	qt_diag(DL_STEP, "STEP SCAN ON");
++	(void)qt_write(ttype, sizeof(ttype));
++	qt_sleep_ms(10);
++	(void)qt_write(&clr, 1);
++	qt_sleep_ms(10);
++	int es = qt_write(scan, sizeof(scan));
++	qt_sleep_ms(20);
++	(void)qt_write(inten, sizeof(inten));
++	qt_sleep_ms(10);
++	snprintf(b, sizeof b, "SCAN %s", es ? "ERR" : "ON");
++	qt_diag(DL_SCAN, b);
++	/* Chip answered at all? An all-0x00 or all-0xFF id means nothing is driving MISO. */
++	bool alive = !((id[0] | id[1] | id[2] | id[3] | id[4]) == 0 ||
++	    (id[0] & id[1] & id[2] & id[3] & id[4]) == 0xff);
++	return alive || ready;
++}
++
++static void
++qt_thread(void *arg, wait_result_t res)
++{
++	unsigned delay_s = 20, div = 4;
++	char b[48];
++	(void)arg;
++	(void)res;
++	(void)PE_parse_boot_argn("q2qtouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("q2qtouchdiv", &div, sizeof(div));
++	if (div < 2 || div > 255) {
++		div = 4;
++	}
++	qt.map.maxx = 4096;
++	qt.map.maxy = 4096;
++	(void)PE_parse_boot_argn("q2qtmx", &qt.map.maxx, sizeof(qt.map.maxx));
++	(void)PE_parse_boot_argn("q2qtmy", &qt.map.maxy, sizeof(qt.map.maxy));
++	(void)PE_parse_boot_argn("q2qtswap", &qt.map.swap, sizeof(qt.map.swap));
++	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
++	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
++	qt_diag(DL_TITLE, "Q2Q TOUCH V1");
++	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
++	qt_diag(DL_STEP, b);
++	qt_sleep_ms(delay_s * 1000u);
++
++	qt_diag(DL_STEP, "STEP MAP");
++	qt.gcc = ml_io_map(GCC_PA, GCC_SIZE);
++	qt.tlmm = ml_io_map(TLMM_PA, TLMM_SIZE);
++	qt.se = ml_io_map(SE_PA, SE_SIZE);
++	if (!qt.gcc || !qt.tlmm || !qt.se) {
++		qt_diag(DL_STATE, "STOP: MAP FAILED");
++		goto out;
++	}
++	qt_diag(DL_STEP, "STEP CLOCKS");
++	if (!qt_clocks()) {
++		qt_diag(DL_STATE, "STOP: SE4 CLOCK OFF");
++		goto out;
++	}
++	qt_diag(DL_STEP, "STEP SE4");
++	if (!qt_se_setup(div)) {
++		goto out;
++	}
++	qt_diag(DL_STEP, "STEP PINS");
++	snprintf(b, sizeof b, "P%03X %03X %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_MISO)) & 0x3ffu,
++	    qt_rd(qt.tlmm, TLMM_CFG(PIN_CS)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_INT)) & 0x3ffu,
++	    qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 3u);
++	qt_diag(DL_PINS, b);
++	qt_pin(PIN_CS, 0, 0, 2, true, true);        /* CS idle high before the bus pins */
++	qt_pin(PIN_MISO, 1, 0, 6, false, false);
++	qt_pin(PIN_MOSI, 1, 0, 6, false, false);
++	qt_pin(PIN_CLK, 1, 0, 6, false, false);
++	qt_pin(PIN_INT, 0, 0, 2, false, false);
++	delay(100);
++
++	if (!qt_chip_start()) {
++		qt_diag(DL_STATE, "STOP: NO ANSWER ON SPI");
++		goto out;
++	}
++	qt_diag(DL_STATE, "RUNNING - TOUCH SCREEN");
++	uint32_t mask = 0, ticks = 0;
++	uint64_t last_draw = 0;
++	for (;;) {
++		bool irq = !(qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 1u);   /* active low */
++		bool changed = false;
++		if (irq || mask || (++ticks % 10u) == 0) {
++			int n = qt_poll(&mask, &changed);
++			if (n < 0 && mask) {
++				mask = 0;          /* bus trouble: release everything */
++				changed = true;
++			}
++		}
++		if (changed) {
++			qt_report(mask);
++		}
++		uint64_t now = qt_now_us();
++		if (changed || now - last_draw > 1000000u) {
++			if (now - last_draw > 100000u) {
++				last_draw = now;
++				uint32_t f = 0;
++				while (f < Q2QT_FINGERS && !(mask & (1u << f))) {
++					f++;
++				}
++				if (f < Q2QT_FINGERS) {
++					snprintf(b, sizeof b, "T%u RAW %u %u", f, qt.rx[f], qt.ry[f]);
++					qt_diag(DL_RAW, b);
++					snprintf(b, sizeof b, "HID %d %d", qt.hx[f], qt.hy[f]);
++					qt_diag(DL_HID, b);
++				} else {
++					qt_diag(DL_HID, "HID UP");
++				}
++				snprintf(b, sizeof b, "EV%u X%u E%u I%u", qt.events, qt.xfers, qt.errors, irq ? 1 : 0);
++				qt_diag(DL_COUNT, b);
++			}
++		}
++		qt_sleep_ms(10);
++	}
++out:
++	(void)thread_terminate(current_thread());
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++q2q_touch_init(void)
++{
++	int enabled = 1;
++	thread_t th;
++	if (qt.started) {
++		return;
++	}
++	qt.started = true;
++	(void)PE_parse_boot_argn("q2qtouch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("Q2Q TOUCH: disabled (q2qtouch=0)\n");
++		return;
++	}
++	if (kernel_thread_start(qt_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("Q2Q TOUCH: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6b926fe..41e1195 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void q2q_touch_init(void);
+ extern void sweet_usb_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_keys_init();
+ 	sweet_touch_init();
++	q2q_touch_init();     /* q2q: Fold3 inner touch (STM FTS9CU80F, SPI SE4) */
+ 	sweet_usb_probe();
+ 	return 0;
+ }
