@@ -10,7 +10,7 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -51,6 +51,438 @@
+@@ -51,6 +51,490 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -146,13 +146,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +    uint32_t fbRowBytes, uint32_t lw, uint32_t lh)
 +{
 +	r->rot = 0;
-+	if ((rot != 1 && rot != 3) || fbW == 0 || fbH == 0 || fbW > SWEET_FB_ROT_MAX ||
++	if ((rot != 1 && rot != 2 && rot != 3) || fbW == 0 || fbH == 0 || fbW > SWEET_FB_ROT_MAX ||
 +	    fbH > SWEET_FB_ROT_MAX || lw == 0 || lh == 0 || lw >= SWEET_FB_ROT_NONE ||
 +	    lh >= SWEET_FB_ROT_NONE || fbRowBytes < fbW * 4) {
 +		return 0;
 +	}
 +	r->fbW = fbW; r->fbH = fbH; r->fbRowBytes = fbRowBytes;
-+	r->pw = fbH; r->ph = fbW;
++	if (rot == 2) {
++		r->pw = fbW; r->ph = fbH;       /* upright panel (Fold3 cover): scale only */
++	} else {
++		r->pw = fbH; r->ph = fbW;
++	}
 +	r->lw = lw; r->lh = lh;
 +	if ((uint64_t)r->pw * lh <= (uint64_t)r->ph * lw) {
 +		r->num = r->pw; r->den = lw;    /* width-limited */
@@ -213,37 +217,64 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	if (r->rot == 0 || px >= r->pw || py >= r->ph) {
 +		return;
 +	}
-+	uint32_t fx = r->rot == 1 ? py : (r->fbW - 1) - py;
-+	uint32_t fy = r->rot == 1 ? (r->fbH - 1) - px : px;
++	uint32_t fx = r->rot == 2 ? px : r->rot == 1 ? py : (r->fbW - 1) - py;
++	uint32_t fy = r->rot == 2 ? py : r->rot == 1 ? (r->fbH - 1) - px : px;
 +	*(volatile uint32_t *)(fb + (uint64_t)fy * r->fbRowBytes + (uint64_t)fx * 4) = color;
 +}
 +
 +/*
-+ * Diagnostic text in the left black bar (outside the iOS image, which iOS never redraws):
-+ * 5x7 glyphs at 3x scale, 24 view rows per line, starting 6 px in from the edge.
++ * Diagnostic text outside the iOS image (iOS never redraws there), 5x7 glyphs:
++ *  - left black bar (inner panel, bars at the sides): 3x scale, 18 px per character, 24 px
++ *    per line;
++ *  - otherwise the top black bar (cover panel, bars above and below): 2x scale, 12 px per
++ *    character, 16 px per line.
++ * Text starts 6 px in from the edges.
 + */
-+#define SWEET_DIAG_SCALE  3
-+#define SWEET_DIAG_ADV    (6 * SWEET_DIAG_SCALE)
-+#define SWEET_DIAG_LINE_H (8 * SWEET_DIAG_SCALE)
 +#define SWEET_DIAG_X0     6u
 +#define SWEET_DIAG_Y0     6u
++
++struct sweet_diag_area {
++	uint32_t x0, y0, cols, lines, scale;
++};
++
++static int
++sweet_fb_diag_area(const struct sweet_fb_rot *r, struct sweet_diag_area *a)
++{
++	a->x0 = SWEET_DIAG_X0;
++	a->y0 = SWEET_DIAG_Y0;
++	a->cols = a->lines = 0;
++	a->scale = 3;
++	if (r->rot == 0) {
++		return 0;
++	}
++	if (r->ox >= SWEET_DIAG_X0 * 2 + 18u * 10u) {
++		a->cols = (r->ox - SWEET_DIAG_X0 * 2) / 18u;
++		a->lines = (r->ph - SWEET_DIAG_Y0) / 24u;
++		return 1;
++	}
++	if (r->oy >= SWEET_DIAG_Y0 * 2 + 16u * 4u) {
++		a->scale = 2;
++		a->cols = (r->pw - SWEET_DIAG_X0 * 2) / 12u;
++		a->lines = (r->oy - SWEET_DIAG_Y0 * 2) / 16u;
++		return 1;
++	}
++	return 0;
++}
 +
 +static uint32_t
 +sweet_fb_diag_cols(const struct sweet_fb_rot *r)
 +{
-+	if (r->rot == 0 || r->ox < SWEET_DIAG_X0 * 2 + SWEET_DIAG_ADV) {
-+		return 0;
-+	}
-+	return (r->ox - SWEET_DIAG_X0 * 2) / SWEET_DIAG_ADV;
++	struct sweet_diag_area a;
++	(void)sweet_fb_diag_area(r, &a);
++	return a.cols;
 +}
 +
 +static uint32_t
 +sweet_fb_diag_lines(const struct sweet_fb_rot *r)
 +{
-+	if (r->rot == 0 || r->ph < SWEET_DIAG_Y0 + SWEET_DIAG_LINE_H) {
-+		return 0;
-+	}
-+	return (r->ph - SWEET_DIAG_Y0) / SWEET_DIAG_LINE_H;
++	struct sweet_diag_area a;
++	(void)sweet_fb_diag_area(r, &a);
++	return a.lines;
 +}
 +
 +/* Decimal digits of v at out (no NUL), at most 20; returns the count. */
@@ -266,14 +297,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +static void
 +sweet_fb_diag_draw(const struct sweet_fb_rot *r, uintptr_t fb, uint32_t line, const char *text)
 +{
-+	uint32_t cols = sweet_fb_diag_cols(r);
-+	if (cols == 0 || line >= sweet_fb_diag_lines(r)) {
++	struct sweet_diag_area a;
++	if (!sweet_fb_diag_area(r, &a) || a.cols == 0 || line >= a.lines) {
 +		return;
 +	}
-+	uint32_t y0 = SWEET_DIAG_Y0 + line * SWEET_DIAG_LINE_H;
-+	for (uint32_t y = 0; y < SWEET_DIAG_LINE_H; y++) {
-+		for (uint32_t x = 0; x < cols * SWEET_DIAG_ADV; x++) {
-+			sweet_fb_rot_putview(r, fb, SWEET_DIAG_X0 + x, y0 + y, 0);
++	uint32_t s = a.scale, adv = 6u * s, lh = 8u * s, cols = a.cols;
++	uint32_t y0 = a.y0 + line * lh;
++	for (uint32_t y = 0; y < lh; y++) {
++		for (uint32_t x = 0; x < cols * adv; x++) {
++			sweet_fb_rot_putview(r, fb, a.x0 + x, y0 + y, 0);
 +		}
 +	}
 +	for (uint32_t c = 0; c < cols && text != NULL && text[c] != '\0'; c++) {
@@ -284,11 +316,10 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				if (!(g[gy] & (0x10u >> gx))) {
 +					continue;
 +				}
-+				for (uint32_t dy = 0; dy < SWEET_DIAG_SCALE; dy++) {
-+					for (uint32_t dx = 0; dx < SWEET_DIAG_SCALE; dx++) {
-+						sweet_fb_rot_putview(r, fb,
-+						    SWEET_DIAG_X0 + c * SWEET_DIAG_ADV + gx * SWEET_DIAG_SCALE + dx,
-+						    y0 + gy * SWEET_DIAG_SCALE + dy, 0x00ffffffu);
++				for (uint32_t dy = 0; dy < s; dy++) {
++					for (uint32_t dx = 0; dx < s; dx++) {
++						sweet_fb_rot_putview(r, fb, a.x0 + c * adv + gx * s + dx,
++						    y0 + gy * s + dy, 0x00ffffffu);
 +					}
 +				}
 +			}
@@ -361,6 +392,26 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	if (py1 > r->oy + r->dh) {
 +		py1 = r->oy + r->dh;
 +	}
++	if (r->rot == 2) {
++		/* upright: panel rows are view rows; read and write along rows */
++		for (uint32_t py = py0; py < py1; py++) {
++			uint32_t v = r->vtab[py];
++			if (v == SWEET_FB_ROT_NONE || v < vy0 || v >= vy1) {
++				continue;
++			}
++			const uint32_t *srow = (const uint32_t *)(srcBase +
++			    (uint64_t)((uint32_t)sy + (v - vy0)) * srcRowBytes);
++			uint32_t *drow = (uint32_t *)(fb + (uint64_t)py * r->fbRowBytes);
++			for (uint32_t px = px0; px < px1; px++) {
++				uint32_t u = r->utab[px];
++				if (u == SWEET_FB_ROT_NONE || u < ux0 || u >= ux1) {
++					continue;
++				}
++				drow[px] = srow[(uint32_t)sx + (u - ux0)];
++			}
++		}
++		return;
++	}
 +	for (uint32_t pyb = py0; pyb < py1; pyb += SWEET_FB_ROT_TILE) {
 +		uint32_t pye = pyb + SWEET_FB_ROT_TILE < py1 ? pyb + SWEET_FB_ROT_TILE : py1;
 +		for (uint32_t px = px0; px < px1; px++) {
@@ -391,6 +442,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +#define SWEET_DIAG_MAX_LINES 96
 +static char sweet_fb_diag_text[SWEET_DIAG_MAX_LINES][40];
 +static uintptr_t sweet_fb_diag_pixels;
++static uint32_t sweet_fb_diag_on;     /* boot-arg sweetfb_diag=1 shows them; default off */
 +
 +extern "C" void
 +sweet_fb_diag(unsigned line, const char *text)
@@ -403,7 +455,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		sweet_fb_diag_text[line][i] = text[i];
 +	}
 +	sweet_fb_diag_text[line][i] = '\0';
-+	if (sweet_fb_rot_state.rot != 0 && sweet_fb_rot_cleared && sweet_fb_diag_pixels != 0) {
++	if (sweet_fb_diag_on && sweet_fb_rot_state.rot != 0 && sweet_fb_rot_cleared && sweet_fb_diag_pixels != 0) {
 +		sweet_fb_diag_draw(&sweet_fb_rot_state, sweet_fb_diag_pixels, line, sweet_fb_diag_text[line]);
 +	}
 +}
@@ -418,7 +470,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +static void
 +sweet_fb_diag_tick(uint64_t ticks)
 +{
-+	if (sweet_fb_rot_state.rot == 0 || !sweet_fb_rot_cleared || sweet_fb_diag_pixels == 0) {
++	if (!sweet_fb_diag_on || sweet_fb_rot_state.rot == 0 || !sweet_fb_rot_cleared || sweet_fb_diag_pixels == 0) {
 +		return;
 +	}
 +	uint32_t last = sweet_fb_diag_lines(&sweet_fb_rot_state);
@@ -449,12 +501,17 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -176,6 +608,17 @@
+@@ -176,6 +660,22 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 +	uint32_t rot = 0;
++	(void)PE_parse_boot_argn("sweetfb_diag", &sweet_fb_diag_on, sizeof(sweet_fb_diag_on));
 +	if (PE_parse_boot_argn("sweetfb_rot", &rot, sizeof(rot)) && rot != 0) {
++		/* q2q fold-at-boot: the cover panel scans out upright (taller than wide): scale only */
++		if ((rot == 1 || rot == 3) && fWidth < fHeight) {
++			rot = 2;
++		}
 +		if (sweet_fb_rot_setup(&sweet_fb_rot_state, rot, fWidth, fHeight, fRowBytes,
 +		    fLogicalW, fLogicalH)) {
 +			IOLog("SWEET FB: rotation %u, scale %u/%u, image %ux%u at %u,%u\n", rot,
@@ -467,7 +524,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -212,6 +655,9 @@
+@@ -212,6 +712,9 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -477,7 +534,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -359,6 +805,41 @@
+@@ -359,6 +862,41 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -503,7 +560,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +					sweet_fb_rot_cleared = true;
 +					sweet_fb_rot_clear(&sweet_fb_rot_state, fPixels);
 +					sweet_fb_diag_pixels = fPixels;
-+					for (uint32_t dl = 0; dl < SWEET_DIAG_MAX_LINES; dl++) {
++					for (uint32_t dl = 0; sweet_fb_diag_on && dl < SWEET_DIAG_MAX_LINES; dl++) {
 +						if (sweet_fb_diag_text[dl][0] != '\0') {
 +							sweet_fb_diag_draw(&sweet_fb_rot_state, fPixels, dl,
 +							    sweet_fb_diag_text[dl]);
