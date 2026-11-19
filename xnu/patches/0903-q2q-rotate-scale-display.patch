@@ -1,0 +1,213 @@
+From: q2q port
+Subject: [PATCH] q2q: rotated, scaled presentation (boot-arg sweetfb_rot)
+
+The Z Fold3 inner panel scans 2208x1768 landscape. With sweetfb_rot=1 or 3 the
+1125x2436 logical display is scaled to fit the upright panel (2208/2436, 1019x2208,
+centered with black bars) and rotated 90 degrees one way or the other. Without the
+boot-arg the copy is unchanged.
+
+---
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -176,6 +176,17 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	uint32_t rot = 0;
++	if (PE_parse_boot_argn("sweetfb_rot", &rot, sizeof(rot)) && rot != 0) {
++		if (sweet_fb_rot_setup(&sweet_fb_rot_state, rot, fWidth, fHeight, fRowBytes,
++		    fLogicalW, fLogicalH)) {
++			IOLog("SWEET FB: rotation %u, scale %u/%u, image %ux%u at %u,%u\n", rot,
++			    sweet_fb_rot_state.num, sweet_fb_rot_state.den, sweet_fb_rot_state.dw,
++			    sweet_fb_rot_state.dh, sweet_fb_rot_state.ox, sweet_fb_rot_state.oy);
++		} else {
++			IOLog("SWEET FB: sweetfb_rot=%u not usable, unrotated\n", rot);
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -289,6 +300,147 @@
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
++/*
++ * q2q: rotated + scaled presentation (boot-arg sweetfb_rot=1 or 3).
++ *
++ * The Fold3 inner panel scans 2208x1768 (landscape) while iOS draws a 1125x2436 portrait
++ * display. Held upright, the panel is a 1768-wide, 2208-tall "portrait view" (px, py). The
++ * logical display is scaled to fit that view (nearest neighbour, aspect kept, centered, black
++ * bars) and rotated into the panel:
++ *   rot 1: panel x = py,            panel y = (fbH - 1) - px
++ *   rot 3: panel x = (fbW - 1) - py, panel y = px            (the opposite 90 degrees)
++ * Writes go along panel rows (contiguous); the source is read in 64-row tiles so its cache
++ * lines are reused across neighbouring panel rows.
++ */
++#define SWEET_FB_ROT_MAX  4096
++#define SWEET_FB_ROT_NONE 0xffffu
++#define SWEET_FB_ROT_TILE 64
++
++struct sweet_fb_rot {
++	uint32_t rot;                   /* 0 = off */
++	uint32_t fbW, fbH, fbRowBytes;  /* panel scan */
++	uint32_t pw, ph;                /* portrait view = fbH x fbW */
++	uint32_t lw, lh;                /* logical display */
++	uint32_t num, den;              /* scale = num / den */
++	uint32_t ox, oy, dw, dh;        /* scaled image inside the view */
++	uint16_t utab[SWEET_FB_ROT_MAX]; /* view px -> logical x, or NONE */
++	uint16_t vtab[SWEET_FB_ROT_MAX]; /* view py -> logical y, or NONE */
++};
++
++static int
++sweet_fb_rot_setup(struct sweet_fb_rot *r, uint32_t rot, uint32_t fbW, uint32_t fbH,
++    uint32_t fbRowBytes, uint32_t lw, uint32_t lh)
++{
++	r->rot = 0;
++	if ((rot != 1 && rot != 3) || fbW == 0 || fbH == 0 || fbW > SWEET_FB_ROT_MAX ||
++	    fbH > SWEET_FB_ROT_MAX || lw == 0 || lh == 0 || lw >= SWEET_FB_ROT_NONE ||
++	    lh >= SWEET_FB_ROT_NONE || fbRowBytes < fbW * 4) {
++		return 0;
++	}
++	r->fbW = fbW; r->fbH = fbH; r->fbRowBytes = fbRowBytes;
++	r->pw = fbH; r->ph = fbW;
++	r->lw = lw; r->lh = lh;
++	if ((uint64_t)r->pw * lh <= (uint64_t)r->ph * lw) {
++		r->num = r->pw; r->den = lw;    /* width-limited */
++	} else {
++		r->num = r->ph; r->den = lh;    /* height-limited (q2q: 2208 / 2436) */
++	}
++	r->dw = (uint32_t)((uint64_t)lw * r->num / r->den);
++	r->dh = (uint32_t)((uint64_t)lh * r->num / r->den);
++	if (r->dw > r->pw) {
++		r->dw = r->pw;
++	}
++	if (r->dh > r->ph) {
++		r->dh = r->ph;
++	}
++	r->ox = (r->pw - r->dw) / 2;
++	r->oy = (r->ph - r->dh) / 2;
++	for (uint32_t px = 0; px < SWEET_FB_ROT_MAX; px++) {
++		uint32_t u = SWEET_FB_ROT_NONE;
++		if (px >= r->ox && px < r->ox + r->dw) {
++			u = (uint32_t)((uint64_t)(px - r->ox) * r->den / r->num);
++			if (u >= lw) {
++				u = SWEET_FB_ROT_NONE;
++			}
++		}
++		r->utab[px] = (uint16_t)u;
++	}
++	for (uint32_t py = 0; py < SWEET_FB_ROT_MAX; py++) {
++		uint32_t v = SWEET_FB_ROT_NONE;
++		if (py >= r->oy && py < r->oy + r->dh) {
++			v = (uint32_t)((uint64_t)(py - r->oy) * r->den / r->num);
++			if (v >= lh) {
++				v = SWEET_FB_ROT_NONE;
++			}
++		}
++		r->vtab[py] = (uint16_t)v;
++	}
++	r->rot = rot;
++	return 1;
++}
++
++/* Black panel (volatile 32-bit stores: no DC ZVA on the uncached panel mapping). */
++static void
++sweet_fb_rot_clear(const struct sweet_fb_rot *r, uintptr_t fb)
++{
++	for (uint32_t y = 0; y < r->fbH; y++) {
++		volatile uint32_t *row = (volatile uint32_t *)(fb + (uint64_t)y * r->fbRowBytes);
++		for (uint32_t x = 0; x < r->fbW; x++) {
++			row[x] = 0;
++		}
++	}
++}
++
++/*
++ * Show the logical rectangle (lx, ly, w, h), whose pixels start at source pixel (sx, sy) of a
++ * 32-bit surface at srcBase with srcRowBytes per row. The caller clips the rectangle to the
++ * logical display and to the surface.
++ */
++static void
++sweet_fb_rot_copy(const struct sweet_fb_rot *r, uintptr_t fb, uintptr_t srcBase,
++    uint32_t srcRowBytes, int32_t sx, int32_t sy, int32_t lx, int32_t ly, int32_t w, int32_t h)
++{
++	if (r->rot == 0 || w <= 0 || h <= 0 || lx < 0 || ly < 0 || sx < 0 || sy < 0) {
++		return;
++	}
++	uint32_t ux0 = (uint32_t)lx, ux1 = (uint32_t)(lx + w);
++	uint32_t vy0 = (uint32_t)ly, vy1 = (uint32_t)(ly + h);
++	uint32_t px0 = r->ox + (uint32_t)((uint64_t)ux0 * r->num / r->den);
++	uint32_t px1 = r->ox + (uint32_t)(((uint64_t)ux1 * r->num + r->den - 1) / r->den);
++	uint32_t py0 = r->oy + (uint32_t)((uint64_t)vy0 * r->num / r->den);
++	uint32_t py1 = r->oy + (uint32_t)(((uint64_t)vy1 * r->num + r->den - 1) / r->den);
++	if (px1 > r->ox + r->dw) {
++		px1 = r->ox + r->dw;
++	}
++	if (py1 > r->oy + r->dh) {
++		py1 = r->oy + r->dh;
++	}
++	for (uint32_t pyb = py0; pyb < py1; pyb += SWEET_FB_ROT_TILE) {
++		uint32_t pye = pyb + SWEET_FB_ROT_TILE < py1 ? pyb + SWEET_FB_ROT_TILE : py1;
++		for (uint32_t px = px0; px < px1; px++) {
++			uint32_t u = r->utab[px];
++			if (u == SWEET_FB_ROT_NONE || u < ux0 || u >= ux1) {
++				continue;
++			}
++			uintptr_t col = srcBase + (uint64_t)((uint32_t)sx + (u - ux0)) * 4;
++			uint32_t fy = r->rot == 1 ? (r->fbH - 1) - px : px;
++			uint32_t *row = (uint32_t *)(fb + (uint64_t)fy * r->fbRowBytes);
++			for (uint32_t py = pyb; py < pye; py++) {
++				uint32_t v = r->vtab[py];
++				if (v == SWEET_FB_ROT_NONE || v < vy0 || v >= vy1) {
++					continue;
++				}
++				uint32_t fx = r->rot == 1 ? py : (r->fbW - 1) - py;
++				row[fx] = *(const uint32_t *)(col +
++				    (uint64_t)((uint32_t)sy + (v - vy0)) * srcRowBytes);
++			}
++		}
++	}
++}
++
++static struct sweet_fb_rot sweet_fb_rot_state;
++static bool sweet_fb_rot_cleared;
++
+ /* Copy each enabled layer's surface into the panel memory (no scaling). */
+ /*
+  * A swap only records the frame: copying 10 MB into the panel on every
+@@ -359,6 +511,34 @@
+ 		if (dx < 0 || dy < 0) {
+ 			dx = dy = 0;
+ 		}
++		if (sweet_fb_rot_state.rot != 0) {
++			/* q2q: logical display -> scaled, rotated panel (sweet_fb_rot_copy). */
++			if (w > (int32_t)s->width - sx) {
++				w = (int32_t)s->width - sx;
++			}
++			if (h > (int32_t)s->height - sy) {
++				h = (int32_t)s->height - sy;
++			}
++			if (w > (int32_t)fLogicalW - dx) {
++				w = (int32_t)fLogicalW - dx;
++			}
++			if (h > (int32_t)fLogicalH - dy) {
++				h = (int32_t)fLogicalH - dy;
++			}
++			if (src != 0 && bpe == 4 && w > 0 && h > 0 && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->memory != NULL &&
++			    (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
++			    (uint64_t)(sx + w) * 4 <= s->memory->getLength()) {
++				if (!sweet_fb_rot_cleared) {
++					sweet_fb_rot_cleared = true;
++					sweet_fb_rot_clear(&sweet_fb_rot_state, fPixels);
++				}
++				sweet_fb_rot_copy(&sweet_fb_rot_state, fPixels, src + s->offset,
++				    s->bytesPerRow, sx, sy, dx, dy, w, h);
++			}
++			s->release();
++			continue;
++		}
+ 		/* Logical (presented) display coordinates -> panel coordinates. */
+ 		dx -= fOffX;
+ 		dy -= fOffY;
