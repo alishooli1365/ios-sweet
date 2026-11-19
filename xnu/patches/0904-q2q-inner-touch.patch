@@ -22,10 +22,10 @@ index 6630131..ea13696 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..45623d7
+index 0000000..34ee604
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1190 @@
+@@ -0,0 +1,1328 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -403,6 +403,44 @@ index 0000000..45623d7
 +	return e;
 +}
 +
++/*
++ * General I2C transfer: write wn bytes, then (if rn) a repeated START and read rn bytes (ACK all
++ * but the last), then STOP. Used for the cover touch controller (fts9cu59 at 0x49): register
++ * writes are the raw command bytes, reads write the register then read (no dummy byte).
++ */
++static int
++q2qt_i2c_xfer(const struct q2qt_i2c_ops *o, uint8_t addr, const uint8_t *w, uint32_t wn,
++    uint8_t *r, uint32_t rn)
++{
++	int e = q2qt_i2c_start(o);
++	if (!e && wn) {
++		e = q2qt_i2c_put(o, (uint8_t)(addr << 1));
++		for (uint32_t i = 0; !e && i < wn; i++) {
++			e = q2qt_i2c_put(o, w[i]);
++		}
++		if (!e && rn) {
++			e = q2qt_i2c_start(o);
++		}
++	}
++	if (!e && rn) {
++		e = q2qt_i2c_put(o, (uint8_t)((addr << 1) | 1u));
++		for (uint32_t i = 0; !e && i < rn; i++) {
++			e = q2qt_i2c_get(o, i + 1 < rn, &r[i]);
++		}
++	}
++	q2qt_i2c_stop(o);
++	return e;
++}
++
++/* s2mpb02 (camera / cover PMIC, 7-bit address 0x59): the cover touch supplies. */
++#define S2MPB02_ADDR      0x59u
++#define S2MPB02_L8CTRL    0x25u   /* bit 7 enable; 0.6 V + 25 mV * sel: 1.8 V = 48 */
++#define S2MPB02_L14CTRL   0x2Bu   /* bit 7 enable; 2.8 V = 88 */
++#define S2MPB02_LDO_EN    0x80u
++#define S2MPB02_VSEL      0x7fu
++#define S2MPB02_SEL_1V8   48u
++#define S2MPB02_SEL_2V8   88u
++
 +/* s2dos05 (display PMIC, 7-bit address 0x60): the inner touch supplies. */
 +#define S2DOS05_ADDR     0x60u
 +#define S2DOS05_DEV_ID   0x00u
@@ -454,6 +492,10 @@ index 0000000..45623d7
 +#define PIN_INT         165u
 +#define PIN_PM_SDA      76u               /* i2c@52 (i2c-gpio): s2dos05 display PMIC */
 +#define PIN_PM_SCL      77u
++#define PIN_CT_SDA      72u               /* cover touch: qupv3_se17_i2c pins, bias-pull-up */
++#define PIN_CT_SCL      73u
++#define PIN_CT_INT      34u
++#define CT_ADDR         0x49u             /* fts9cu59 */
 +
 +#define SE_PA           0x00990000u
 +#define SE_SIZE         0x4000u
@@ -529,6 +571,9 @@ index 0000000..45623d7
 +	bool bb;                  /* GPIO bit-banged SPI (SE4 FIFO interface disabled) */
 +	uint32_t bb_us;           /* half clock period, microseconds (0 = as fast as the bus) */
 +	uint32_t i2c_us;          /* PMIC I2C quarter period, microseconds */
++	bool cover;               /* ABL lit the cover panel (folded at power-on) */
++	bool i2c;                 /* touch controller on bit-banged I2C (cover) instead of SPI */
++	uint32_t int_pin;         /* controller interrupt line (active low) */
 +	bool started;
 +	uint32_t active;          /* finger bit mask reported down */
 +	int32_t hx[Q2QT_FINGERS], hy[Q2QT_FINGERS];
@@ -740,22 +785,79 @@ index 0000000..45623d7
 + * PMIC I2C on gpio76/77: open drain emulated with the output latch at 0, toggling only the
 + * output enable (released = input; the board has pull-ups: Samsung's pinctrl is bias-disable).
 + */
++struct qt_i2c_bus {
++	uint32_t sda, scl;
++	uint32_t pull;            /* TLMM pull while released: 0 none (board pull-ups), 3 up */
++	uint32_t us;              /* quarter bit period */
++};
++static struct qt_i2c_bus qt_pm_bus = { PIN_PM_SDA, PIN_PM_SCL, 0, 3 };
++static struct qt_i2c_bus qt_ts_bus = { PIN_CT_SDA, PIN_CT_SCL, 3, 2 };
++
 +static void
-+qt_od(uint32_t pin, int release)
++qt_od(uint32_t pin, int release, uint32_t pull)
 +{
-+	*(volatile uint32_t *)(qt.tlmm + TLMM_CFG(pin)) = release ? 0u : (1u << 9);
++	*(volatile uint32_t *)(qt.tlmm + TLMM_CFG(pin)) = release ? pull : (1u << 9);
 +	__asm__ volatile ("dsb sy" ::: "memory");
 +}
 +
-+static void qt_i2c_sda(void *ctx, int r) { (void)ctx; qt_od(PIN_PM_SDA, r); }
-+static void qt_i2c_scl(void *ctx, int r) { (void)ctx; qt_od(PIN_PM_SCL, r); }
-+static int qt_i2c_sda_in(void *ctx) { (void)ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(PIN_PM_SDA)) & 1u); }
-+static int qt_i2c_scl_in(void *ctx) { (void)ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(PIN_PM_SCL)) & 1u); }
-+static void qt_i2c_wait(void *ctx) { (void)ctx; delay((int)qt.i2c_us); }
++static void qt_i2c_sda(void *ctx, int r) { struct qt_i2c_bus *b = ctx; qt_od(b->sda, r, b->pull); }
++static void qt_i2c_scl(void *ctx, int r) { struct qt_i2c_bus *b = ctx; qt_od(b->scl, r, b->pull); }
++static int qt_i2c_sda_in(void *ctx) { struct qt_i2c_bus *b = ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(b->sda)) & 1u); }
++static int qt_i2c_scl_in(void *ctx) { struct qt_i2c_bus *b = ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(b->scl)) & 1u); }
++static void qt_i2c_wait(void *ctx) { struct qt_i2c_bus *b = ctx; delay((int)b->us); }
 +
 +static const struct q2qt_i2c_ops qt_i2c_ops = {
-+	qt_i2c_sda, qt_i2c_scl, qt_i2c_sda_in, qt_i2c_scl_in, qt_i2c_wait, NULL,
++	qt_i2c_sda, qt_i2c_scl, qt_i2c_sda_in, qt_i2c_scl_in, qt_i2c_wait, &qt_pm_bus,
 +};
++static const struct q2qt_i2c_ops qt_ts_ops = {
++	qt_i2c_sda, qt_i2c_scl, qt_i2c_sda_in, qt_i2c_scl_in, qt_i2c_wait, &qt_ts_bus,
++};
++
++/* Release both lines of a bit-banged bus (output latch 0, input with the bus's pull). */
++static void
++qt_i2c_idle(const struct qt_i2c_bus *b)
++{
++	qt_wr(qt.tlmm, TLMM_IO(b->sda), 0);
++	qt_wr(qt.tlmm, TLMM_IO(b->scl), 0);
++	qt_od(b->sda, 1, b->pull);
++	qt_od(b->scl, 1, b->pull);
++	delay(50);
++}
++
++/*
++ * Cover touch power: s2mpb02 LDO8 (1.8 V IO) and LDO14 (2.8 V AVDD) on the same i2c@52 bus.
++ * Each control register holds only the enable bit and the voltage selector; read first, write
++ * nothing if the PMIC does not answer, never touch any other regulator.
++ */
++static bool
++qt_power_cover(void)
++{
++	char b[48];
++	uint8_t l8 = 0, l14 = 0, l8b = 0, l14b = 0;
++	const uint8_t want8 = S2MPB02_LDO_EN | S2MPB02_SEL_1V8, want14 = S2MPB02_LDO_EN | S2MPB02_SEL_2V8;
++	qt_i2c_idle(&qt_pm_bus);
++	int e = q2qt_i2c_read_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L8CTRL, &l8);
++	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L14CTRL, &l14);
++	if (e) {
++		snprintf(b, sizeof b, "PMB NO ANSWER E%d", e);
++		qt_diag(DL_PMIC, b);
++		return false;
++	}
++	snprintf(b, sizeof b, "PMB L8 %02X L14 %02X", l8, l14);
++	qt_diag(DL_PMIC, b);
++	if (l8 != want8) {
++		e |= q2qt_i2c_write_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L8CTRL, want8);
++	}
++	if (l14 != want14) {
++		e |= q2qt_i2c_write_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L14CTRL, want14);
++	}
++	qt_sleep_ms(20);
++	int e2 = q2qt_i2c_read_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L8CTRL, &l8b);
++	if (!e2) e2 = q2qt_i2c_read_reg(&qt_i2c_ops, S2MPB02_ADDR, S2MPB02_L14CTRL, &l14b);
++	snprintf(b, sizeof b, "PWRB %02X %02X %s", l8b, l14b, (e || e2) ? "ERR" : "OK");
++	qt_diag(DL_PWR, b);
++	return !e && !e2 && l8b == want8 && l14b == want14;
++}
 +
 +/*
 + * Touch power: s2dos05 LDO2 (1.8 V IO) and LDO3 (3.0 V AVDD). The bootloader leaves them off
@@ -771,11 +873,7 @@ index 0000000..45623d7
 +	snprintf(b, sizeof b, "PMP %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_PM_SDA)) & 0x3ffu,
 +	    qt_rd(qt.tlmm, TLMM_CFG(PIN_PM_SCL)) & 0x3ffu);
 +	qt_diag(DL_PMIC, b);
-+	qt_wr(qt.tlmm, TLMM_IO(PIN_PM_SDA), 0);
-+	qt_wr(qt.tlmm, TLMM_IO(PIN_PM_SCL), 0);
-+	qt_od(PIN_PM_SDA, 1);
-+	qt_od(PIN_PM_SCL, 1);
-+	delay(50);
++	qt_i2c_idle(&qt_pm_bus);
 +	int e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_DEV_ID, &id);
 +	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_EN, &en);
 +	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_LDO2_CFG, &l2);
@@ -891,6 +989,10 @@ index 0000000..45623d7
 +static int
 +qt_write(const uint8_t *cmd, uint32_t n)
 +{
++	if (qt.i2c) {          /* I2C controller: the command bytes as they are */
++		qt.xfers++;
++		return q2qt_i2c_xfer(&qt_ts_ops, CT_ADDR, cmd, n, NULL, 0) ? EIO : 0;
++	}
 +	uint32_t len = q2qt_frame_write(cmd, n, qt_tx, sizeof(qt_tx));
 +	return len ? qt_xfer(qt_tx, qt_rxb, len) : EINVAL;
 +}
@@ -900,6 +1002,16 @@ index 0000000..45623d7
 +{
 +	uint32_t off = 0;
 +	int pre = 0;
++	if (qt.i2c) {          /* write the register, repeated START, read (no turnaround byte) */
++		qt.xfers++;
++		int e = q2qt_i2c_xfer(&qt_ts_ops, CT_ADDR, reg, tlen, out, rlen);
++		if (e && (qt.errors++ % 50u) == 0) {
++			char b[48];
++			snprintf(b, sizeof b, "I2C ERR %d REG %02X", e, reg[0]);
++			qt_diag(DL_ERR, b);
++		}
++		return e ? EIO : 0;
++	}
 +	uint32_t len = q2qt_frame_read(reg, tlen, rlen, qt_tx, sizeof(qt_tx), &off, &pre);
 +	if (len == 0) {
 +		return EINVAL;
@@ -941,7 +1053,8 @@ index 0000000..45623d7
 +qt_poll(uint32_t *mask, bool *changed)
 +{
 +	static uint8_t evs[Q2QT_FIFO_MAX * Q2QT_EVENT_SIZE];
-+	const uint8_t cmd = 0x87;
++	/* SPI (inner): 0x87 for one and for the rest; I2C (cover): 0x60 one, 0x61 all */
++	const uint8_t cmd = qt.i2c ? 0x60 : 0x87, cmd_all = qt.i2c ? 0x61 : 0x87;
 +	int err = qt_read(&cmd, 1, evs, Q2QT_EVENT_SIZE);
 +	if (err) {
 +		return -err;
@@ -953,7 +1066,7 @@ index 0000000..45623d7
 +	}
 +	uint32_t count = 1 + (o.left < Q2QT_FIFO_MAX ? o.left : Q2QT_FIFO_MAX - 1u);
 +	if (count > 1) {
-+		err = qt_read(&cmd, 1, evs + Q2QT_EVENT_SIZE, (count - 1) * Q2QT_EVENT_SIZE);
++		err = qt_read(&cmd_all, 1, evs + Q2QT_EVENT_SIZE, (count - 1) * Q2QT_EVENT_SIZE);
 +		if (err) {
 +			count = 1;
 +		}
@@ -1004,7 +1117,7 @@ index 0000000..45623d7
 +	const uint8_t rid = 0x22, rhw[5] = {0xFB, 0x20, 0x00, 0x00, 0x00};
 +	const uint8_t reset[6] = {0xFA, 0x20, 0x00, 0x00, 0x24, 0x81};
 +	const uint8_t ttype[3] = {0x30, 0x00, 0x61}, clr = 0x62, scan[3] = {0xA0, 0x00, 0x01};
-+	const uint8_t inten[3] = {0xA4, 0x01, 0x01}, rev = 0x87;
++	const uint8_t inten[3] = {0xA4, 0x01, 0x01}, rev = qt.i2c ? 0x60 : 0x87;
 +	struct q2qt_ev o;
 +
 +	sweet_fb_diag_stage = 70;
@@ -1087,8 +1200,14 @@ index 0000000..45623d7
 +	(void)PE_parse_boot_argn("q2qtswap", &qt.map.swap, sizeof(qt.map.swap));
 +	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
 +	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
++	qt_pm_bus.us = qt.i2c_us;
++	/* Fold-at-boot: the shim hands XNU the panel ABL lit; the cover scans out upright. */
++	PE_Video video;
++	if (PE_current_console(&video) == 0 && video.v_width != 0 && video.v_width < video.v_height) {
++		qt.cover = true;
++	}
 +	sweet_fb_diag_stage = 1;
-+	qt_diag(DL_TITLE, "Q2Q TOUCH V4");
++	qt_diag(DL_TITLE, qt.cover ? "Q2Q TOUCH V5 COVER" : "Q2Q TOUCH V5");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
@@ -1104,6 +1223,24 @@ index 0000000..45623d7
 +		goto out;
 +	}
 +	sweet_fb_diag_stage = 3;
++	if (qt.cover) {
++		/* cover touch: s2mpb02 LDO8/LDO14, fts9cu59 at 0x49 on gpio72/73, IRQ gpio34 */
++		qt.i2c = true;
++		qt.int_pin = PIN_CT_INT;
++		snprintf(b, sizeof b, "CT P%03X %03X %03X %X", qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SDA)) & 0x3ffu,
++		    qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_SCL)) & 0x3ffu, qt_rd(qt.tlmm, TLMM_CFG(PIN_CT_INT)) & 0x3ffu,
++		    qt_rd(qt.tlmm, TLMM_IO(PIN_CT_INT)) & 3u);
++		qt_diag(DL_PINS, b);
++		qt_pin(PIN_CT_INT, 0, 0, 2, false, false);
++		sweet_fb_diag_stage = 60;
++		qt_diag(DL_STEP, "STEP POWER COVER");
++		bool on = qt_power_cover();
++		sweet_fb_diag_stage = on ? 61 : 62;
++		qt_i2c_idle(&qt_ts_bus);
++		qt_sleep_ms(200);
++		goto chip;
++	}
++	qt.int_pin = PIN_INT;
 +	qt_diag(DL_STEP, "STEP CLOCKS");
 +	if (!qt_clocks()) {
 +		sweet_fb_diag_stage = 92;
@@ -1146,9 +1283,10 @@ index 0000000..45623d7
 +		qt_sleep_ms(200);      /* controller boot after power-up */
 +	}
 +
++chip:
 +	if (!qt_chip_start()) {
 +		sweet_fb_diag_stage = 94;
-+		qt_diag(DL_STATE, "STOP: NO ANSWER ON SPI");
++		qt_diag(DL_STATE, qt.i2c ? "STOP: NO ANSWER ON I2C" : "STOP: NO ANSWER ON SPI");
 +		goto out;
 +	}
 +	sweet_fb_diag_stage = 8;
@@ -1156,7 +1294,7 @@ index 0000000..45623d7
 +	uint32_t mask = 0, ticks = 0;
 +	uint64_t last_draw = 0;
 +	for (;;) {
-+		bool irq = !(qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 1u);   /* active low */
++		bool irq = !(qt_rd(qt.tlmm, TLMM_IO(qt.int_pin)) & 1u);   /* active low */
 +		bool changed = false;
 +		if (irq || mask || (++ticks % 10u) == 0) {
 +			int n = qt_poll(&mask, &changed);
