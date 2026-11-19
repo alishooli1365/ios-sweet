@@ -10,27 +10,9 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -176,6 +176,17 @@
- 	}
- 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
- 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
-+	uint32_t rot = 0;
-+	if (PE_parse_boot_argn("sweetfb_rot", &rot, sizeof(rot)) && rot != 0) {
-+		if (sweet_fb_rot_setup(&sweet_fb_rot_state, rot, fWidth, fHeight, fRowBytes,
-+		    fLogicalW, fLogicalH)) {
-+			IOLog("SWEET FB: rotation %u, scale %u/%u, image %ux%u at %u,%u\n", rot,
-+			    sweet_fb_rot_state.num, sweet_fb_rot_state.den, sweet_fb_rot_state.dw,
-+			    sweet_fb_rot_state.dh, sweet_fb_rot_state.ox, sweet_fb_rot_state.oy);
-+		} else {
-+			IOLog("SWEET FB: sweetfb_rot=%u not usable, unrotated\n", rot);
-+		}
-+	}
- 	fLock = IOLockAlloc();
- 	fClients = OSArray::withCapacity(4);
- 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -289,6 +300,147 @@
- static uint32_t sweet_fb_swaps_logged;
- static uint64_t sweet_fb_swap_count;
+@@ -51,6 +51,147 @@
+ #include <kern/clock.h>
+ #include <sys/proc.h>
  
 +/*
 + * q2q: rotated + scaled presentation (boot-arg sweetfb_rot=1 or 3).
@@ -173,9 +155,27 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +static struct sweet_fb_rot sweet_fb_rot_state;
 +static bool sweet_fb_rot_cleared;
 +
- /* Copy each enabled layer's surface into the panel memory (no scaling). */
- /*
-  * A swap only records the frame: copying 10 MB into the panel on every
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -176,6 +317,17 @@
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	uint32_t rot = 0;
++	if (PE_parse_boot_argn("sweetfb_rot", &rot, sizeof(rot)) && rot != 0) {
++		if (sweet_fb_rot_setup(&sweet_fb_rot_state, rot, fWidth, fHeight, fRowBytes,
++		    fLogicalW, fLogicalH)) {
++			IOLog("SWEET FB: rotation %u, scale %u/%u, image %ux%u at %u,%u\n", rot,
++			    sweet_fb_rot_state.num, sweet_fb_rot_state.den, sweet_fb_rot_state.dw,
++			    sweet_fb_rot_state.dh, sweet_fb_rot_state.ox, sweet_fb_rot_state.oy);
++		} else {
++			IOLog("SWEET FB: sweetfb_rot=%u not usable, unrotated\n", rot);
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
 @@ -359,6 +511,34 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
