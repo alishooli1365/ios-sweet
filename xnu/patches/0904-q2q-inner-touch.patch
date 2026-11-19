@@ -22,10 +22,10 @@ index 6630131..ea13696 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..c6360e3
+index 0000000..45623d7
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,957 @@
+@@ -0,0 +1,1190 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -58,7 +58,8 @@ index 0000000..c6360e3
 +extern void sweet_fb_diag(unsigned line, const char *text);
 +extern int sweet_fb_touch_to_hid(uint32_t fx16, uint32_t fy16, int32_t *hx, int32_t *hy);
 +/* Progress number shown on the frame-side heartbeat line ("FB <s> T<stage>"):
-+ * 1 started, 2 waited, 3 mapped, 4 clocks on, 5 SE4 set up, 6 pins, 70 chip id, 71 reset,
++ * 1 started, 2 waited, 3 mapped, 4 clocks on, 5 SE4 set up, 6 pins, 60 powering touch,
++ * 61 touch power on, 62 PMIC did not answer / power not confirmed, 70 chip id, 71 reset,
 + * 72 scan on, 8 running; 9x = stopped (91 map, 92 clock, 93 SE4 not SPI/busy, 94 no answer). */
 +extern volatile uint32_t sweet_fb_diag_stage;
 +void q2q_touch_init(void);
@@ -272,6 +273,148 @@ index 0000000..c6360e3
 +	}
 +}
 +
++/*
++ * GPIO ("bit-banged") I2C master, open drain emulated: a line is pulled low by driving 0 and
++ * released (pulled high by the board) by switching it to input. Used for the q2q i2c-gpio bus
++ * "i2c@52" (SDA gpio76, SCL gpio77) that carries the s2dos05 display PMIC at 0x60, whose LDO2
++ * (1.8 V) and LDO3 (3.0 V) power the inner touch controller.
++ */
++struct q2qt_i2c_ops {
++	void (*sda)(void *ctx, int release);
++	void (*scl)(void *ctx, int release);
++	int (*sda_in)(void *ctx);
++	int (*scl_in)(void *ctx);
++	void (*wait)(void *ctx);         /* quarter of a bit period */
++	void *ctx;
++};
++
++static int
++q2qt_i2c_scl_high(const struct q2qt_i2c_ops *o)
++{
++	o->scl(o->ctx, 1);
++	for (unsigned i = 0; i < 1000; i++) {   /* clock stretching */
++		if (o->scl_in(o->ctx)) {
++			o->wait(o->ctx);
++			return 0;
++		}
++		o->wait(o->ctx);
++	}
++	return -1;
++}
++
++static int
++q2qt_i2c_start(const struct q2qt_i2c_ops *o)
++{
++	o->sda(o->ctx, 1);
++	if (q2qt_i2c_scl_high(o)) {
++		return -1;
++	}
++	if (!o->sda_in(o->ctx)) {
++		return -2;                      /* bus held low by someone */
++	}
++	o->sda(o->ctx, 0);
++	o->wait(o->ctx);
++	o->scl(o->ctx, 0);
++	o->wait(o->ctx);
++	return 0;
++}
++
++static void
++q2qt_i2c_stop(const struct q2qt_i2c_ops *o)
++{
++	o->sda(o->ctx, 0);
++	o->wait(o->ctx);
++	(void)q2qt_i2c_scl_high(o);
++	o->sda(o->ctx, 1);
++	o->wait(o->ctx);
++}
++
++/* Returns 0 on ACK, 1 on NACK, -1 on a stuck clock. */
++static int
++q2qt_i2c_put(const struct q2qt_i2c_ops *o, uint8_t v)
++{
++	for (int bit = 7; bit >= 0; bit--) {
++		o->sda(o->ctx, (v >> bit) & 1);
++		o->wait(o->ctx);
++		if (q2qt_i2c_scl_high(o)) {
++			return -1;
++		}
++		o->scl(o->ctx, 0);
++		o->wait(o->ctx);
++	}
++	o->sda(o->ctx, 1);                  /* release for ACK */
++	o->wait(o->ctx);
++	if (q2qt_i2c_scl_high(o)) {
++		return -1;
++	}
++	int nack = o->sda_in(o->ctx);
++	o->scl(o->ctx, 0);
++	o->wait(o->ctx);
++	return nack ? 1 : 0;
++}
++
++static int
++q2qt_i2c_get(const struct q2qt_i2c_ops *o, int ack, uint8_t *v)
++{
++	uint8_t in = 0;
++	o->sda(o->ctx, 1);
++	for (int bit = 7; bit >= 0; bit--) {
++		o->wait(o->ctx);
++		if (q2qt_i2c_scl_high(o)) {
++			return -1;
++		}
++		in = (uint8_t)((in << 1) | (o->sda_in(o->ctx) & 1));
++		o->scl(o->ctx, 0);
++	}
++	o->sda(o->ctx, ack ? 0 : 1);
++	o->wait(o->ctx);
++	if (q2qt_i2c_scl_high(o)) {
++		return -1;
++	}
++	o->scl(o->ctx, 0);
++	o->wait(o->ctx);
++	o->sda(o->ctx, 1);
++	*v = in;
++	return 0;
++}
++
++/* Register read: START addr+W reg, repeated START addr+R, data, NACK, STOP. 0 = OK. */
++static int
++q2qt_i2c_read_reg(const struct q2qt_i2c_ops *o, uint8_t addr, uint8_t reg, uint8_t *v)
++{
++	int e = q2qt_i2c_start(o);
++	if (!e) e = q2qt_i2c_put(o, (uint8_t)(addr << 1));
++	if (!e) e = q2qt_i2c_put(o, reg);
++	if (!e) e = q2qt_i2c_start(o);
++	if (!e) e = q2qt_i2c_put(o, (uint8_t)((addr << 1) | 1u));
++	if (!e) e = q2qt_i2c_get(o, 0, v);
++	q2qt_i2c_stop(o);
++	return e;
++}
++
++static int
++q2qt_i2c_write_reg(const struct q2qt_i2c_ops *o, uint8_t addr, uint8_t reg, uint8_t v)
++{
++	int e = q2qt_i2c_start(o);
++	if (!e) e = q2qt_i2c_put(o, (uint8_t)(addr << 1));
++	if (!e) e = q2qt_i2c_put(o, reg);
++	if (!e) e = q2qt_i2c_put(o, v);
++	q2qt_i2c_stop(o);
++	return e;
++}
++
++/* s2dos05 (display PMIC, 7-bit address 0x60): the inner touch supplies. */
++#define S2DOS05_ADDR     0x60u
++#define S2DOS05_DEV_ID   0x00u
++#define S2DOS05_EN       0x03u
++#define S2DOS05_LDO2_CFG 0x05u   /* 1.5 V + 25 mV * sel; 1.8 V = 12 */
++#define S2DOS05_LDO3_CFG 0x06u   /* 2.7 V + 25 mV * sel; 3.0 V = 12 */
++#define S2DOS05_EN_L2    (1u << 1)
++#define S2DOS05_EN_L3    (1u << 2)
++#define S2DOS05_VSEL     0x7fu
++#define S2DOS05_SEL_1V8  12u
++#define S2DOS05_SEL_3V0  12u
++
 +/* Upper-case hex of n bytes, space separated, into out (cap includes the NUL). */
 +static void
 +q2qt_hex(char *out, uint32_t cap, const uint8_t *b, uint32_t n)
@@ -309,6 +452,8 @@ index 0000000..c6360e3
 +#define PIN_CLK         22u
 +#define PIN_CS          23u
 +#define PIN_INT         165u
++#define PIN_PM_SDA      76u               /* i2c@52 (i2c-gpio): s2dos05 display PMIC */
++#define PIN_PM_SCL      77u
 +
 +#define SE_PA           0x00990000u
 +#define SE_SIZE         0x4000u
@@ -375,12 +520,15 @@ index 0000000..c6360e3
 +#define DL_HID    13
 +#define DL_COUNT  14
 +#define DL_ERR    15
++#define DL_PMIC   16
++#define DL_PWR    17
 +
 +static struct {
 +	vm_offset_t gcc, tlmm, se;
 +	uint32_t depth;           /* FIFO words */
 +	bool bb;                  /* GPIO bit-banged SPI (SE4 FIFO interface disabled) */
 +	uint32_t bb_us;           /* half clock period, microseconds (0 = as fast as the bus) */
++	uint32_t i2c_us;          /* PMIC I2C quarter period, microseconds */
 +	bool started;
 +	uint32_t active;          /* finger bit mask reported down */
 +	int32_t hx[Q2QT_FINGERS], hy[Q2QT_FINGERS];
@@ -587,6 +735,76 @@ index 0000000..c6360e3
 +static const struct q2qt_bb_ops qt_bb_ops = {
 +	qt_bb_clk, qt_bb_mosi, qt_bb_miso, qt_bb_wait, NULL,
 +};
++
++/*
++ * PMIC I2C on gpio76/77: open drain emulated with the output latch at 0, toggling only the
++ * output enable (released = input; the board has pull-ups: Samsung's pinctrl is bias-disable).
++ */
++static void
++qt_od(uint32_t pin, int release)
++{
++	*(volatile uint32_t *)(qt.tlmm + TLMM_CFG(pin)) = release ? 0u : (1u << 9);
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static void qt_i2c_sda(void *ctx, int r) { (void)ctx; qt_od(PIN_PM_SDA, r); }
++static void qt_i2c_scl(void *ctx, int r) { (void)ctx; qt_od(PIN_PM_SCL, r); }
++static int qt_i2c_sda_in(void *ctx) { (void)ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(PIN_PM_SDA)) & 1u); }
++static int qt_i2c_scl_in(void *ctx) { (void)ctx; return (int)(qt_rd(qt.tlmm, TLMM_IO(PIN_PM_SCL)) & 1u); }
++static void qt_i2c_wait(void *ctx) { (void)ctx; delay((int)qt.i2c_us); }
++
++static const struct q2qt_i2c_ops qt_i2c_ops = {
++	qt_i2c_sda, qt_i2c_scl, qt_i2c_sda_in, qt_i2c_scl_in, qt_i2c_wait, NULL,
++};
++
++/*
++ * Touch power: s2dos05 LDO2 (1.8 V IO) and LDO3 (3.0 V AVDD). The bootloader leaves them off
++ * (seen: chip id all zero, interrupt line low). Read first; only ever SET the two enable bits
++ * (LDO1 / BUCK1 power the panel and must stay as they are); nothing is written if the PMIC does
++ * not answer. Returns true when both are on afterwards.
++ */
++static bool
++qt_power(void)
++{
++	char b[48];
++	uint8_t id = 0, en = 0, l2 = 0, l3 = 0, en2 = 0;
++	snprintf(b, sizeof b, "PMP %03X %03X", qt_rd(qt.tlmm, TLMM_CFG(PIN_PM_SDA)) & 0x3ffu,
++	    qt_rd(qt.tlmm, TLMM_CFG(PIN_PM_SCL)) & 0x3ffu);
++	qt_diag(DL_PMIC, b);
++	qt_wr(qt.tlmm, TLMM_IO(PIN_PM_SDA), 0);
++	qt_wr(qt.tlmm, TLMM_IO(PIN_PM_SCL), 0);
++	qt_od(PIN_PM_SDA, 1);
++	qt_od(PIN_PM_SCL, 1);
++	delay(50);
++	int e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_DEV_ID, &id);
++	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_EN, &en);
++	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_LDO2_CFG, &l2);
++	if (!e) e = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_LDO3_CFG, &l3);
++	if (e) {
++		snprintf(b, sizeof b, "PM NO ANSWER E%d", e);
++		qt_diag(DL_PMIC, b);
++		return false;
++	}
++	snprintf(b, sizeof b, "PM%02X EN%02X L%02X %02X", id, en, l2, l3);
++	qt_diag(DL_PMIC, b);
++	if ((l2 & S2DOS05_VSEL) != S2DOS05_SEL_1V8) {
++		e |= q2qt_i2c_write_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_LDO2_CFG,
++		    (uint8_t)((l2 & ~S2DOS05_VSEL) | S2DOS05_SEL_1V8));
++	}
++	if ((l3 & S2DOS05_VSEL) != S2DOS05_SEL_3V0) {
++		e |= q2qt_i2c_write_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_LDO3_CFG,
++		    (uint8_t)((l3 & ~S2DOS05_VSEL) | S2DOS05_SEL_3V0));
++	}
++	if ((en & (S2DOS05_EN_L2 | S2DOS05_EN_L3)) != (S2DOS05_EN_L2 | S2DOS05_EN_L3)) {
++		e |= q2qt_i2c_write_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_EN,
++		    (uint8_t)(en | S2DOS05_EN_L2 | S2DOS05_EN_L3));
++	}
++	qt_sleep_ms(20);
++	int e2 = q2qt_i2c_read_reg(&qt_i2c_ops, S2DOS05_ADDR, S2DOS05_EN, &en2);
++	snprintf(b, sizeof b, "PWR EN%02X>%02X %s", en, en2, (e || e2) ? "ERR" : "OK");
++	qt_diag(DL_PWR, b);
++	return !e && !e2 && (en2 & (S2DOS05_EN_L2 | S2DOS05_EN_L3)) == (S2DOS05_EN_L2 | S2DOS05_EN_L3);
++}
 +
 +/* One full-duplex SPI transfer of n bytes with CS (GPIO23) held low. */
 +static int
@@ -852,6 +1070,11 @@ index 0000000..c6360e3
 +	if (div < 2 || div > 255) {
 +		div = 4;
 +	}
++	qt.i2c_us = 3;
++	(void)PE_parse_boot_argn("q2qti2cus", &qt.i2c_us, sizeof(qt.i2c_us));
++	if (qt.i2c_us == 0 || qt.i2c_us > 100) {
++		qt.i2c_us = 3;
++	}
 +	qt.bb_us = 1;
 +	(void)PE_parse_boot_argn("q2qtbbus", &qt.bb_us, sizeof(qt.bb_us));
 +	if (qt.bb_us > 100) {
@@ -865,7 +1088,7 @@ index 0000000..c6360e3
 +	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
 +	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
 +	sweet_fb_diag_stage = 1;
-+	qt_diag(DL_TITLE, "Q2Q TOUCH V3");
++	qt_diag(DL_TITLE, "Q2Q TOUCH V4");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
@@ -912,6 +1135,16 @@ index 0000000..c6360e3
 +	qt_pin(PIN_INT, 0, 0, 2, false, false);
 +	delay(100);
 +	sweet_fb_diag_stage = 6;
++
++	int pwr = 1;
++	(void)PE_parse_boot_argn("q2qtpwr", &pwr, sizeof(pwr));
++	if (pwr) {
++		sweet_fb_diag_stage = 60;
++		qt_diag(DL_STEP, "STEP POWER");
++		bool on = qt_power();
++		sweet_fb_diag_stage = on ? 61 : 62;
++		qt_sleep_ms(200);      /* controller boot after power-up */
++	}
 +
 +	if (!qt_chip_start()) {
 +		sweet_fb_diag_stage = 94;
