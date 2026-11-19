@@ -255,10 +255,10 @@ index 0000000..975b29e
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..d5ded2a
+index 0000000..87332f7
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1375 @@
+@@ -0,0 +1,1423 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -426,8 +426,9 @@ index 0000000..d5ded2a
 +
 +/* Raw controller coordinates -> fractions (1/65536) of the upright view. */
 +struct q2qt_map {
-+	uint32_t maxx, maxy;   /* raw range (exclusive) */
++	uint32_t maxx, maxy;   /* raw range end (exclusive) */
 +	int swap, flipx, flipy;
++	uint32_t minx, miny;   /* raw range start (inclusive), default 0 */
 +};
 +
 +static void
@@ -435,6 +436,17 @@ index 0000000..d5ded2a
 +{
 +	uint32_t a = m->swap ? y : x, b = m->swap ? x : y;
 +	uint32_t ma = m->swap ? m->maxy : m->maxx, mb = m->swap ? m->maxx : m->maxy;
++	uint32_t na = m->swap ? m->miny : m->minx, nb = m->swap ? m->minx : m->miny;
++	if (na >= ma) {
++		na = 0;
++	}
++	if (nb >= mb) {
++		nb = 0;
++	}
++	a = a > na ? a - na : 0;
++	b = b > nb ? b - nb : 0;
++	ma -= na;
++	mb -= nb;
 +	if (ma == 0) {
 +		ma = 1;
 +	}
@@ -833,6 +845,9 @@ index 0000000..d5ded2a
 +	struct q2qt_map map;
 +	uint64_t last_us;         /* last time a finger was down */
 +	uint32_t events, ticks;
++	/* calibration record: raw range seen, first and latest contact */
++	bool seen;
++	uint32_t xmin, xmax, ymin, ymax, x1, y1, xl, yl;
 +};
 +static struct qt_ctl qt_in, qt_cv;
 +static unsigned qt_dl_off;    /* diagnostic line offset: 0 inner, 20 cover */
@@ -1351,6 +1366,17 @@ index 0000000..d5ded2a
 +		if (o.ttype == 5u) {    /* palm: never a touch */
 +			continue;
 +		}
++		if (!c->seen) {
++			c->seen = true;
++			c->x1 = c->xmin = c->xmax = o.x;
++			c->y1 = c->ymin = c->ymax = o.y;
++		}
++		c->xmin = o.x < c->xmin ? o.x : c->xmin;
++		c->xmax = o.x > c->xmax ? o.x : c->xmax;
++		c->ymin = o.y < c->ymin ? o.y : c->ymin;
++		c->ymax = o.y > c->ymax ? o.y : c->ymax;
++		c->xl = o.x;
++		c->yl = o.y;
 +		uint32_t fx, fy;
 +		int32_t hx, hy;
 +		q2qt_raw_to_view(&c->map, o.x, o.y, &fx, &fy);
@@ -1467,6 +1493,10 @@ index 0000000..d5ded2a
 +	(void)PE_parse_boot_argn("q2qtcswap", &qt_cv.map.swap, sizeof(qt_cv.map.swap));
 +	(void)PE_parse_boot_argn("q2qtcfx", &qt_cv.map.flipx, sizeof(qt_cv.map.flipx));
 +	(void)PE_parse_boot_argn("q2qtcfy", &qt_cv.map.flipy, sizeof(qt_cv.map.flipy));
++	(void)PE_parse_boot_argn("q2qtx0", &qt_in.map.minx, sizeof(qt_in.map.minx));
++	(void)PE_parse_boot_argn("q2qty0", &qt_in.map.miny, sizeof(qt_in.map.miny));
++	(void)PE_parse_boot_argn("q2qtcx0", &qt_cv.map.minx, sizeof(qt_cv.map.minx));
++	(void)PE_parse_boot_argn("q2qtcy0", &qt_cv.map.miny, sizeof(qt_cv.map.miny));
 +	int want_in = 1, want_cv = 1;
 +	(void)PE_parse_boot_argn("q2qtinner", &want_in, sizeof(want_in));
 +	(void)PE_parse_boot_argn("q2qtcover", &want_cv, sizeof(want_cv));
@@ -1605,6 +1635,24 @@ index 0000000..d5ded2a
 +			qt_diag(DL_HID, b);
 +			snprintf(b, sizeof b, "X%u E%u", qt.xfers, qt.errors);
 +			qt_diag(DL_COUNT, b);
++			/* calibration: cover lines 30..33, inner lines 34..37 */
++			struct qt_ctl *cs[2] = { &qt_cv, &qt_in };
++			for (unsigned k = 0; k < 2; k++) {
++				struct qt_ctl *c = cs[k];
++				unsigned l0 = 30u + 4u * k;
++				const char *n = k ? "IN" : "CV";
++				if (!c->seen) {
++					continue;
++				}
++				snprintf(b, sizeof b, "%s X %u-%u", n, c->xmin, c->xmax);
++				sweet_fb_diag(l0, b);
++				snprintf(b, sizeof b, "%s Y %u-%u", n, c->ymin, c->ymax);
++				sweet_fb_diag(l0 + 1, b);
++				snprintf(b, sizeof b, "%s 1ST %u %u", n, c->x1, c->y1);
++				sweet_fb_diag(l0 + 2, b);
++				snprintf(b, sizeof b, "%s LAST %u %u", n, c->xl, c->yl);
++				sweet_fb_diag(l0 + 3, b);
++			}
 +		}
 +		qt_sleep_ms(10);
 +	}
