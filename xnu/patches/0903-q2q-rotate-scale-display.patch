@@ -579,7 +579,23 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -359,6 +907,48 @@
+@@ -238,6 +786,15 @@
+ 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+ 				}
+ 			}
++			if (sweet_fb_cover_pixels != 0) {   /* q2q duo: the cover window fades too */
++				for (uint32_t y = 0; y < sweet_fb_rot_cover.fbH; y++) {
++					volatile uint32_t *row = (volatile uint32_t *)(sweet_fb_cover_pixels +
++					    (uint64_t)y * sweet_fb_rot_cover.fbRowBytes);
++					for (uint32_t x = 0; x < sweet_fb_rot_cover.fbW; x++) {
++						row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
++					}
++				}
++			}
+ 		}
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+@@ -359,6 +916,48 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}

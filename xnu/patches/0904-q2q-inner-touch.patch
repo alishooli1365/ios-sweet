@@ -9,17 +9,250 @@ q2qtouchdelay, q2qtouchdiv, q2qtmx, q2qtmy, q2qtswap, q2qtfx, q2qtfy.
 
 ---
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..ea13696 100644
+index 6630131..dd5f0af 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,7 @@ bsd/dev/sweet_ufs.c			standard
+@@ -108,6 +108,8 @@ bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 +bsd/dev/q2q_touch.c			standard
++bsd/dev/q2q_keys.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
+diff --git a/bsd/dev/q2q_keys.c b/bsd/dev/q2q_keys.c
+new file mode 100644
+index 0000000..975b29e
+--- /dev/null
++++ b/bsd/dev/q2q_keys.c
+@@ -0,0 +1,226 @@
++/*
++ * q2q (Samsung Galaxy Z Fold3, SM8350) buttons for ios-sweet XNU: power, volume up, volume
++ * down, polled every 20 ms and reported with sweet_hid_key(). Same approach as ios-sweet's
++ * sweet_keys.c (Pixel 4a): PMIC access is READ ONLY, through the SPMI arbiter v5 observer
++ * channel (the only MMIO writes are EXT_READL commands); no PMIC configuration, interrupt or
++ * reset writes. The SM8350 arbiter sits at the same addresses as on SM7150 (lahaina.dtsi:
++ * core 0x0c440000, obsrvr 0x0e600000, cnfg 0x0c40a000).
++ * Boot-arg q2qkeys=0 disables it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_fb_diag(unsigned line, const char *text);
++void q2q_keys_init(void);
++
++/*
++ * q2q (Galaxy Z Fold3) buttons, hardware-independent part (shared by q2q_keys.c and its host
++ * test). Facts from Samsung's SM-F926B source:
++ *  - power and volume down: PMK8350 (SPMI SID 0) PON "pon_hlos" at 0x1300, a PON gen3 block:
++ *    RT_STS = base + 0x10, KPDPWR_N = bit 7, RESIN_N = bit 6 (qpnp-power-on.c);
++ *  - volume up: gpio-keys on PM8350 (SID 1) GPIO 6, active low; PMIC GPIO n sits at
++ *    0x8800 + (n - 1) * 0x100, so GPIO 6 = 0x8D00; its live input level is RT_STS bit 0
++ *    (pinctrl-spmi-gpio.c PMIC_MPP_REG_RT_STS).
++ * SPMI PPID = SID << 8 | (register >> 8).
++ */
++#define Q2QK_PON_PPID     0x013u
++#define Q2QK_PON_RT       0x1310u
++#define Q2QK_PON_PWR_BIT  (1u << 7)
++#define Q2QK_PON_VDN_BIT  (1u << 6)
++#define Q2QK_VUP_PPID     0x18Du
++#define Q2QK_VUP_RT       0x8D10u
++#define Q2QK_VUP_MODE     0x8D40u
++#define Q2QK_VUP_EN       0x8D46u
++#define Q2QK_VUP_SUBTYPE  0x8D05u
++
++enum { Q2QK_POWER = 0, Q2QK_VOLUP = 1, Q2QK_VOLDOWN = 2, Q2QK_N = 3 };   /* sweet_hid_key ids */
++
++/* SPMI arbiter v5 observer EXT_READL command for one byte at addr (within the peripheral). */
++static uint32_t
++q2qk_obs_cmd(uint16_t addr)
++{
++	return (1u << 27) | ((uint32_t)(addr & 0xffu) << 4);
++}
++
++/* Key states from the two raw registers. */
++static void
++q2qk_decode(uint8_t pon_rt, uint8_t vup_rt, int down[Q2QK_N])
++{
++	down[Q2QK_POWER] = (pon_rt & Q2QK_PON_PWR_BIT) ? 1 : 0;
++	down[Q2QK_VOLDOWN] = (pon_rt & Q2QK_PON_VDN_BIT) ? 1 : 0;
++	down[Q2QK_VOLUP] = (vup_rt & 1u) ? 0 : 1;      /* active low */
++}
++
++/* Is the PMIC GPIO enabled and an input (or input/output)? Read-only check, never repaired. */
++static int
++q2qk_gpio_is_input(uint8_t subtype, uint8_t mode, uint8_t en)
++{
++	unsigned dir = (subtype >= 0x10u && subtype <= 0x13u) ? (mode & 3u) : ((mode >> 4) & 7u);
++	return (en & 0x80u) && (dir == 0 || dir == 2);
++}
++
++#define QK_CORE_PA      0x0c440000u
++#define QK_OBS_PA       0x0e600000u
++#define QK_CNFG_PA      0x0c40a000u
++#define QK_NO_APID      0xffffu
++#define QK_DL           40u           /* diagnostic line (left bar, below the touch lines) */
++
++static vm_offset_t qk_core, qk_obs, qk_cnfg;
++static uint16_t qk_pon_apid = QK_NO_APID, qk_vup_apid = QK_NO_APID;
++static uint32_t qk_status;
++static bool qk_started;
++static int qk_chan;
++
++static uint32_t
++qk_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* A PPID may be mapped to more than one APID on v5; prefer the apps-owned (owner 0) entry. */
++static uint16_t
++qk_find_apid(uint16_t ppid, uint32_t count)
++{
++	uint16_t found = QK_NO_APID;
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = qk_rd(qk_core, 0x900u + 4u * i);
++		if (map == 0 || ((map >> 8) & 0xfffu) != ppid) {
++			continue;
++		}
++		uint32_t owner = qk_rd(qk_cnfg, 0x700u + 4u * i) & 7u;
++		if (found == QK_NO_APID || owner == 0) {
++			found = (uint16_t)i;
++		}
++	}
++	return found;
++}
++
++static bool
++qk_read(uint16_t apid, uint16_t addr, uint8_t *out)
++{
++	if (apid == QK_NO_APID) {
++		return false;
++	}
++	uint32_t off = 0x80u * apid;      /* observer channel of this APID, EE 0 */
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(qk_obs + off) = q2qk_obs_cmd(addr);
++	__asm__ volatile ("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		qk_status = qk_rd(qk_obs, off + 0x08u);
++		if (qk_status & 1u) {
++			if (qk_status & 0x0eu) {
++				return false;
++			}
++			*out = (uint8_t)qk_rd(qk_obs, off + 0x18u);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++qk_wait_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&qk_chan, THREAD_UNINT, deadline);
++	(void)thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++qk_thread(void *arg, wait_result_t res)
++{
++	int state[Q2QK_N] = {0, 0, 0};
++	unsigned errors = 0;
++	char b[48];
++	(void)arg;
++	(void)res;
++	for (;;) {
++		uint8_t pon = 0, vup = 1;
++		bool pok = qk_read(qk_pon_apid, Q2QK_PON_RT, &pon);
++		bool gok = qk_vup_apid != QK_NO_APID && qk_read(qk_vup_apid, Q2QK_VUP_RT, &vup);
++		int now[Q2QK_N];
++		q2qk_decode(pon, vup, now);
++		if (!pok && (errors++ % 250u) == 0) {
++			printf("Q2Q KEYS: PON read error, arbiter status %#x\n", qk_status);
++		}
++		for (int k = 0; k < Q2QK_N; k++) {
++			bool ok = (k == Q2QK_VOLUP) ? gok : pok;
++			if (ok && now[k] != state[k]) {
++				state[k] = now[k];
++				printf("Q2Q KEYS: key %d %s (pon %#x vup %#x)\n", k, state[k] ? "down" : "up", pon, vup);
++				snprintf(b, sizeof b, "KEY %d %s P%02X V%02X", k, state[k] ? "DN" : "UP", pon, vup);
++				sweet_fb_diag(QK_DL + 1, b);
++				sweet_hid_key(k, state[k]);
++			}
++		}
++		qk_wait_ms(20);
++	}
++}
++
++void
++q2q_keys_init(void)
++{
++	int enabled = 1;
++	thread_t th;
++	char b[48];
++	if (qk_started) {
++		return;
++	}
++	qk_started = true;
++	(void)PE_parse_boot_argn("q2qkeys", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("Q2Q KEYS: disabled (q2qkeys=0)\n");
++		return;
++	}
++	qk_core = ml_io_map(QK_CORE_PA, 0x2000);
++	qk_cnfg = ml_io_map(QK_CNFG_PA, 0x1000);
++	qk_obs = ml_io_map(QK_OBS_PA, 0x10000);
++	if (!qk_core || !qk_cnfg || !qk_obs) {
++		printf("Q2Q KEYS: MMIO mapping failed\n");
++		return;
++	}
++	uint32_t version = qk_rd(qk_core, 0);
++	uint32_t count = qk_rd(qk_core, 4) & 0x7ffu;
++	if (version < 0x50000000u || version >= 0x70000000u || count == 0 || count > 512) {
++		printf("Q2Q KEYS: unsupported SPMI arbiter version %#x apids %u\n", version, count);
++		snprintf(b, sizeof b, "KEYS ARB %08X N%u", version, count);
++		sweet_fb_diag(QK_DL, b);
++		return;
++	}
++	qk_pon_apid = qk_find_apid(Q2QK_PON_PPID, count);
++	qk_vup_apid = qk_find_apid(Q2QK_VUP_PPID, count);
++	uint8_t pon = 0, vup = 0, mode = 0, en = 0, sub = 0;
++	bool pok = qk_read(qk_pon_apid, Q2QK_PON_RT, &pon);
++	bool gok = qk_read(qk_vup_apid, Q2QK_VUP_RT, &vup);
++	bool mok = qk_read(qk_vup_apid, Q2QK_VUP_MODE, &mode);
++	bool eok = qk_read(qk_vup_apid, Q2QK_VUP_EN, &en);
++	bool sok = qk_read(qk_vup_apid, Q2QK_VUP_SUBTYPE, &sub);
++	printf("Q2Q KEYS: arb %#x apids %u pon-apid %u vup-apid %u pon %#x/%d vup %#x/%d mode %#x en %#x sub %#x\n",
++	    version, count, qk_pon_apid, qk_vup_apid, pon, pok, vup, gok, mode, en, sub);
++	snprintf(b, sizeof b, "KEYS A%u/%u P%02X%c V%02X%c", qk_pon_apid & 0x3ffu, qk_vup_apid & 0x3ffu,
++	    pon, pok ? '+' : '-', vup, gok ? '+' : '-');
++	sweet_fb_diag(QK_DL, b);
++	/* GPIO configuration belongs to the bootloader: diagnose, never change it. */
++	if (!gok || !mok || !eok || !sok || !q2qk_gpio_is_input(sub, mode, en)) {
++		printf("Q2Q KEYS: PM8350 GPIO6 not confirmed as an enabled input; volume up withheld\n");
++		qk_vup_apid = QK_NO_APID;
++	}
++	if (kernel_thread_start(qk_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	} else {
++		printf("Q2Q KEYS: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
 index 0000000..d5ded2a
@@ -1402,22 +1635,24 @@ index 0000000..d5ded2a
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6b926fe..41e1195 100644
+index 6b926fe..7666884 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +52,7 @@ static void sweet_log_start(void);
+@@ -52,6 +52,8 @@ static void sweet_log_start(void);
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
 +extern void q2q_touch_init(void);
++extern void q2q_keys_init(void);
  extern void sweet_usb_probe(void);
  
  #define REG_CAP         0x00
-@@ -659,6 +660,7 @@ sweet_ufs_init(void)
+@@ -659,6 +661,8 @@ sweet_ufs_init(void)
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
-+	q2q_touch_init();     /* q2q: Fold3 inner touch (STM FTS9CU80F, SPI SE4) */
++	q2q_touch_init();     /* q2q: Fold3 touch, inner (SPI) and cover (I2C) */
++	q2q_keys_init();      /* q2q: Fold3 power / volume buttons (PMK8350, PM8350) */
  	sweet_usb_probe();
  	return 0;
  }
