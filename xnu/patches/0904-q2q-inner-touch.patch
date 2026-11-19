@@ -22,10 +22,10 @@ index 6630131..ea13696 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..3167043
+index 0000000..c6360e3
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,854 @@
+@@ -0,0 +1,957 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -242,6 +242,36 @@ index 0000000..3167043
 +	}
 +}
 +
++/*
++ * GPIO ("bit-banged") SPI, mode 0 (clock idle low, data sampled on the rising edge,
++ * changed after the falling edge), MSB first, full duplex. Used when the serial engine's FIFO
++ * interface is disabled (GSI-DMA-only firmware). The caller holds chip select low.
++ */
++struct q2qt_bb_ops {
++	void (*clk)(void *ctx, int level);
++	void (*mosi)(void *ctx, int level);
++	int (*miso)(void *ctx);
++	void (*wait)(void *ctx);      /* half a clock period */
++	void *ctx;
++};
++
++static void
++q2qt_bb_xfer(const struct q2qt_bb_ops *o, const uint8_t *tx, uint8_t *rx, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		uint8_t out = tx[i], in = 0;
++		for (int bit = 7; bit >= 0; bit--) {
++			o->mosi(o->ctx, (out >> bit) & 1);
++			o->wait(o->ctx);
++			o->clk(o->ctx, 1);
++			in = (uint8_t)((in << 1) | (o->miso(o->ctx) & 1));
++			o->wait(o->ctx);
++			o->clk(o->ctx, 0);
++		}
++		rx[i] = in;
++	}
++}
++
 +/* Upper-case hex of n bytes, space separated, into out (cap includes the NUL). */
 +static void
 +q2qt_hex(char *out, uint32_t cap, const uint8_t *b, uint32_t n)
@@ -349,6 +379,8 @@ index 0000000..3167043
 +static struct {
 +	vm_offset_t gcc, tlmm, se;
 +	uint32_t depth;           /* FIFO words */
++	bool bb;                  /* GPIO bit-banged SPI (SE4 FIFO interface disabled) */
++	uint32_t bb_us;           /* half clock period, microseconds (0 = as fast as the bus) */
 +	bool started;
 +	uint32_t active;          /* finger bit mask reported down */
 +	int32_t hx[Q2QT_FINGERS], hy[Q2QT_FINGERS];
@@ -466,6 +498,20 @@ index 0000000..3167043
 +	qt_diag(DL_SE, b);
 +	snprintf(b, sizeof b, "FIFO D%u W%u IF%u", qt.depth, width, ifd & 1u);
 +	qt_diag(DL_FIFO, b);
++	/*
++	 * The q2q bootloader leaves SE4 with SPI firmware but the FIFO interface disabled
++	 * (GSI-DMA only; seen on the device: FW 0x0102, D16 W32 IF1). GSI needs the GPI engine and
++	 * the SMMU, so the pins are driven directly instead (bit-banged SPI). q2qtbb=1 forces
++	 * that, q2qtbb=0 refuses it.
++	 */
++	int bbarg = -1;
++	(void)PE_parse_boot_argn("q2qtbb", &bbarg, sizeof(bbarg));
++	if (bbarg == 1 || ((ifd & 1u) && bbarg != 0)) {
++		qt.bb = true;
++		snprintf(b, sizeof b, "MODE BITBANG %uUS", qt.bb_us);
++		qt_diag(DL_FIFO, b);
++		return true;
++	}
 +	if (proto != GENI_PROTO_SPI || width != 32u || qt.depth < 4u || (ifd & 1u)) {
 +		qt_diag(DL_STATE, "STOP: SE4 NOT SPI FIFO");
 +		return false;
@@ -505,6 +551,43 @@ index 0000000..3167043
 +	return true;
 +}
 +
++/* Bit-banged SPI pin operations (TLMM IO register: bit 1 output level, bit 0 input level). */
++static void
++qt_bb_clk(void *ctx, int level)
++{
++	(void)ctx;
++	*(volatile uint32_t *)(qt.tlmm + TLMM_IO(PIN_CLK)) = level ? 2u : 0u;
++}
++
++static void
++qt_bb_mosi(void *ctx, int level)
++{
++	(void)ctx;
++	*(volatile uint32_t *)(qt.tlmm + TLMM_IO(PIN_MOSI)) = level ? 2u : 0u;
++}
++
++static int
++qt_bb_miso(void *ctx)
++{
++	(void)ctx;
++	__asm__ volatile ("dsb sy" ::: "memory");   /* clock edge reached the pin first */
++	return (int)(*(volatile uint32_t *)(qt.tlmm + TLMM_IO(PIN_MISO)) & 1u);
++}
++
++static void
++qt_bb_wait(void *ctx)
++{
++	(void)ctx;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	if (qt.bb_us) {
++		delay((int)qt.bb_us);
++	}
++}
++
++static const struct q2qt_bb_ops qt_bb_ops = {
++	qt_bb_clk, qt_bb_mosi, qt_bb_miso, qt_bb_wait, NULL,
++};
++
 +/* One full-duplex SPI transfer of n bytes with CS (GPIO23) held low. */
 +static int
 +qt_xfer(const uint8_t *tx, uint8_t *rx, uint32_t n)
@@ -512,6 +595,15 @@ index 0000000..3167043
 +	uint32_t ti = 0, ri = 0, irq = 0;
 +	int err = 0;
 +	qt.xfers++;
++	if (qt.bb) {
++		qt_cs(false);
++		delay(2);
++		q2qt_bb_xfer(&qt_bb_ops, tx, rx, n);
++		delay(2);
++		qt_cs(true);
++		delay(5);
++		return 0;
++	}
 +	qt_cs(false);
 +	qt_wr(qt.se, SE_M_IRQ_CLR, 0xffffffffu);
 +	qt_wr(qt.se, SE_SPI_TX_LEN, n);
@@ -760,6 +852,11 @@ index 0000000..3167043
 +	if (div < 2 || div > 255) {
 +		div = 4;
 +	}
++	qt.bb_us = 1;
++	(void)PE_parse_boot_argn("q2qtbbus", &qt.bb_us, sizeof(qt.bb_us));
++	if (qt.bb_us > 100) {
++		qt.bb_us = 1;
++	}
 +	qt.map.maxx = 4096;
 +	qt.map.maxy = 4096;
 +	(void)PE_parse_boot_argn("q2qtmx", &qt.map.maxx, sizeof(qt.map.maxx));
@@ -768,7 +865,7 @@ index 0000000..3167043
 +	(void)PE_parse_boot_argn("q2qtfx", &qt.map.flipx, sizeof(qt.map.flipx));
 +	(void)PE_parse_boot_argn("q2qtfy", &qt.map.flipy, sizeof(qt.map.flipy));
 +	sweet_fb_diag_stage = 1;
-+	qt_diag(DL_TITLE, "Q2Q TOUCH V2");
++	qt_diag(DL_TITLE, "Q2Q TOUCH V3");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
@@ -803,9 +900,15 @@ index 0000000..3167043
 +	    qt_rd(qt.tlmm, TLMM_IO(PIN_INT)) & 3u);
 +	qt_diag(DL_PINS, b);
 +	qt_pin(PIN_CS, 0, 0, 2, true, true);        /* CS idle high before the bus pins */
-+	qt_pin(PIN_MISO, 1, 0, 6, false, false);
-+	qt_pin(PIN_MOSI, 1, 0, 6, false, false);
-+	qt_pin(PIN_CLK, 1, 0, 6, false, false);
++	if (qt.bb) {
++		qt_pin(PIN_CLK, 0, 0, 6, true, false);  /* mode 0: clock idles low */
++		qt_pin(PIN_MOSI, 0, 0, 6, true, false);
++		qt_pin(PIN_MISO, 0, 0, 2, false, false);
++	} else {
++		qt_pin(PIN_MISO, 1, 0, 6, false, false);
++		qt_pin(PIN_MOSI, 1, 0, 6, false, false);
++		qt_pin(PIN_CLK, 1, 0, 6, false, false);
++	}
 +	qt_pin(PIN_INT, 0, 0, 2, false, false);
 +	delay(100);
 +	sweet_fb_diag_stage = 6;
