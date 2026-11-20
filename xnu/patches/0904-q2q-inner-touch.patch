@@ -255,10 +255,10 @@ index 0000000..975b29e
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..87332f7
+index 0000000..04878d4
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1423 @@
+@@ -0,0 +1,1441 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -831,9 +831,9 @@ index 0000000..87332f7
 +
 +/*
 + * One touch controller ("iPhone Duo": the inner one on SPI and the cover one on I2C both run,
-+ * since iOS is mirrored on both panels). Only one side reports at a time: a side's touches are
-+ * ignored while the other side has had a finger down in the last 3 s (a hand holding the
-+ * phone touches the outer side), and palm events are dropped.
++ * since iOS is mirrored on both panels). Only one side reports at a time: the side with the
++ * most recent new finger-down owns HID (a hand resting on the back, or the folded inner
++ * halves pressing on each other, never makes new presses), and palm events are dropped.
 + */
 +struct qt_ctl {
 +	bool on, i2c, cover;
@@ -845,11 +845,13 @@ index 0000000..87332f7
 +	struct q2qt_map map;
 +	uint64_t last_us;         /* last time a finger was down */
 +	uint32_t events, ticks;
++	uint32_t prev;            /* mask at the previous poll (new presses = mask & ~prev) */
 +	/* calibration record: raw range seen, first and latest contact */
 +	bool seen;
 +	uint32_t xmin, xmax, ymin, ymax, x1, y1, xl, yl;
 +};
 +static struct qt_ctl qt_in, qt_cv;
++static struct qt_ctl *qt_owner;   /* side whose contacts go to HID (latest new press) */
 +static unsigned qt_dl_off;    /* diagnostic line offset: 0 inner, 20 cover */
 +
 +static uint32_t
@@ -1616,10 +1618,26 @@ index 0000000..87332f7
 +					changed = true;
 +				}
 +			}
-+			/* the side in use owns HID; the other side's contacts are ignored meanwhile */
-+			bool blocked = other->on && (other->active != 0 ||
-+			    (other->last_us != 0 && now - other->last_us < 3000000u));
-+			uint32_t report = blocked ? 0 : c->mask;
++			/*
++			 * Ownership (2026-11-20 on the device: a hand on the back of the unfolded
++			 * phone, or the folded inner halves pressing on each other, read as a contact
++			 * that never lifts, so "block while the other side is down" blocked forever).
++			 * The side with the most recent NEW finger-down owns HID; a resting contact
++			 * makes no new presses, so it never takes over.
++			 */
++			uint32_t pressed = c->mask & ~c->prev;
++			c->prev = c->mask;
++			if (pressed != 0 && qt_owner != c) {
++				if (qt_owner != NULL && qt_owner->active != 0) {
++					qt_report(qt_owner, 0);    /* lift the old side's fingers */
++				}
++				qt_owner = c;
++			}
++			if (qt_owner == NULL) {
++				qt_owner = c;
++			}
++			(void)other;
++			uint32_t report = (qt_owner == c) ? c->mask : 0;
 +			if (c->mask) {
 +				c->last_us = now;
 +			}
