@@ -255,10 +255,10 @@ index 0000000..975b29e
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..04878d4
+index 0000000..9cf9ad9
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1441 @@
+@@ -0,0 +1,1482 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -846,12 +846,19 @@ index 0000000..04878d4
 +	uint64_t last_us;         /* last time a finger was down */
 +	uint32_t events, ticks;
 +	uint32_t prev;            /* mask at the previous poll (new presses = mask & ~prev) */
++	uint64_t press_us;        /* time of the latest new press */
 +	/* calibration record: raw range seen, first and latest contact */
 +	bool seen;
 +	uint32_t xmin, xmax, ymin, ymax, x1, y1, xl, yl;
 +};
 +static struct qt_ctl qt_in, qt_cv;
 +static struct qt_ctl *qt_owner;   /* side whose contacts go to HID (latest new press) */
++/* fold sensor: q2qfold=0 off, 80 = TLMM gpio80 (folder_hall), 26 = gpio26 (hall);
++ * q2qfoldlvl = level that means folded (default 1) */
++static uint32_t qt_fold_mode, qt_fold_level = 1;
++static bool qt_folded;
++#define PIN_FOLDER_HALL 80u
++#define PIN_HALL        26u
 +static unsigned qt_dl_off;    /* diagnostic line offset: 0 inner, 20 cover */
 +
 +static uint32_t
@@ -1601,8 +1608,19 @@ index 0000000..04878d4
 +	sweet_fb_diag_stage = 8;
 +
 +	uint64_t last_draw = 0;
++	(void)PE_parse_boot_argn("q2qfold", &qt_fold_mode, sizeof(qt_fold_mode));
++	(void)PE_parse_boot_argn("q2qfoldlvl", &qt_fold_level, sizeof(qt_fold_level));
++	if (qt_fold_mode != PIN_FOLDER_HALL && qt_fold_mode != PIN_HALL) {
++		qt_fold_mode = 0;
++	}
 +	for (;;) {
 +		uint64_t now = qt_now_us();
++		uint32_t g80 = qt_rd(qt.tlmm, TLMM_IO(PIN_FOLDER_HALL)) & 1u;
++		uint32_t g26 = qt_rd(qt.tlmm, TLMM_IO(PIN_HALL)) & 1u;
++		if (qt_fold_mode != 0) {
++			uint32_t lvl = qt_fold_mode == PIN_FOLDER_HALL ? g80 : g26;
++			qt_folded = (lvl == (qt_fold_level & 1u));
++		}
 +		struct qt_ctl *ctls[2] = { &qt_in, &qt_cv };
 +		for (int k = 0; k < 2; k++) {
 +			struct qt_ctl *c = ctls[k], *other = ctls[k ^ 1];
@@ -1627,14 +1645,32 @@ index 0000000..04878d4
 +			 */
 +			uint32_t pressed = c->mask & ~c->prev;
 +			c->prev = c->mask;
-+			if (pressed != 0 && qt_owner != c) {
++			/*
++			 * Fold sensor (optional, q2qfold): folded -> only the cover may own, open ->
++			 * only the inner side. Without it: a new press takes over, except within
++			 * 250 ms of the owner's own new press (one finger seen by both controllers,
++			 * e.g. a press on the folded cover felt by the inner halves).
++			 */
++			bool allowed = true;
++			if (qt_fold_mode != 0) {
++				allowed = qt_folded ? c->cover : !c->cover;
++			}
++			if (pressed != 0) {
++				c->press_us = now;
++			}
++			if (pressed != 0 && qt_owner != c && allowed &&
++			    (qt_owner == NULL || now - qt_owner->press_us > 250000u || qt_fold_mode != 0)) {
 +				if (qt_owner != NULL && qt_owner->active != 0) {
 +					qt_report(qt_owner, 0);    /* lift the old side's fingers */
 +				}
 +				qt_owner = c;
 +			}
-+			if (qt_owner == NULL) {
++			if (qt_owner == NULL && allowed) {
 +				qt_owner = c;
++			}
++			if (qt_fold_mode != 0 && qt_owner == c && !allowed) {
++				qt_report(c, 0);
++				qt_owner = NULL;              /* folded state changed: release this side */
 +			}
 +			(void)other;
 +			uint32_t report = (qt_owner == c) ? c->mask : 0;
@@ -1653,6 +1689,11 @@ index 0000000..04878d4
 +			qt_diag(DL_HID, b);
 +			snprintf(b, sizeof b, "X%u E%u", qt.xfers, qt.errors);
 +			qt_diag(DL_COUNT, b);
++			snprintf(b, sizeof b, "FOLD G80=%u G26=%u M%u %s", g80, g26, qt_fold_mode,
++			    qt_fold_mode ? (qt_folded ? "CLOSED" : "OPEN") : "-");
++			sweet_fb_diag(38, b);
++			snprintf(b, sizeof b, "OWNER %s", qt_owner == &qt_cv ? "COVER" : qt_owner == &qt_in ? "INNER" : "NONE");
++			sweet_fb_diag(39, b);
 +			/* calibration: cover lines 30..33, inner lines 34..37 */
 +			struct qt_ctl *cs[2] = { &qt_cv, &qt_in };
 +			for (unsigned k = 0; k < 2; k++) {
