@@ -82,19 +82,20 @@ index 0000000..15a1f18
 +	printf("Q2QT %d %s %s %x/%x err %d ret %d\n", q2q_trace_lines, what, buf, a, b, error, ret);
 +}
 diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
-index 963acec..8c669ce 100644
+index 963acec..185f04a 100644
 --- a/bsd/vfs/vfs_attrlist.c
 +++ b/bsd/vfs/vfs_attrlist.c
-@@ -46,6 +46,8 @@
+@@ -46,6 +46,9 @@
  #include <sys/uio_internal.h>
  #include <kern/kalloc.h>
  #include <sys/attr.h>
++#include <pexpert/pexpert.h>
 +int q2q_trace_on(void);
 +void q2q_trace_path(const char *what, user_addr_t path, uint32_t a, uint32_t b, int error, int ret);
  #include <sys/sysproto.h>
  #include <sys/xattr.h>
  #include <sys/fsevents.h>
-@@ -3411,8 +3413,10 @@ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
+@@ -3411,8 +3414,10 @@ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
  	return error;
  }
  
@@ -106,16 +107,72 @@ index 963acec..8c669ce 100644
  {
  	enum uio_seg segflg;
  	struct attrlist al;
-@@ -3434,6 +3438,15 @@ getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
+@@ -3434,6 +3439,71 @@ getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
  	           (uint64_t)uap->options, segflg, segflg, AT_FDCWD);
  }
  
++/*
++ * q2q (2026-11-23, Settings crash): PodcastsUI asks the volume size of
++ * [MPMediaLibrary defaultMediaLibrary].databasePath
++ * (/var/mobile/Media/iTunes_Control/iTunes/MediaLibrary.sqlitedb). On our root that file and
++ * its iTunes_Control directory do not exist; CoreServicesInternal's size preparer starts with
++ * getattrlist(path, ATTR_CMN_FSID only), gets ENOENT, URL.volumeTotalCapacity is nil and the
++ * force-unwrap kills Settings. When a request asks for ATTR_CMN_FSID and nothing else and the
++ * path does not exist, answer for the nearest existing ancestor directory instead: same volume
++ * on a single-volume root. Boot-arg q2qfsidfix=0 turns it off.
++ */
++static int
++q2q_getattrlist_fsid_fallback(struct getattrlist_args *uap, const struct attrlist *al, int error)
++{
++	static int q2q_fix = -1;
++	if (q2q_fix < 0) {
++		int v = 1;
++		(void)PE_parse_boot_argn("q2qfsidfix", &v, sizeof(v));
++		q2q_fix = v != 0;
++	}
++	if (!q2q_fix || error != ENOENT || al->commonattr != ATTR_CMN_FSID || al->volattr != 0 ||
++	    al->dirattr != 0 || al->fileattr != 0 || al->forkattr != 0) {
++		return error;
++	}
++	char *buf = (char *)zalloc_flags(ZV_NAMEI, Z_WAITOK | Z_ZERO);
++	size_t len = 0;
++	if (copyinstr(CAST_USER_ADDR_T(uap->path), buf, MAXPATHLEN, &len) != 0 || buf[0] != '/') {
++		zfree(ZV_NAMEI, buf);
++		return error;
++	}
++	for (int i = 0; i < 64 && error == ENOENT; i++) {
++		char *slash = strrchr(buf, '/');
++		if (slash == NULL) {
++			break;
++		}
++		if (slash == buf) {
++			if (buf[1] == '\0') {
++				break;          /* "/" itself missing: give up */
++			}
++			buf[1] = '\0';      /* try the root */
++		} else {
++			*slash = '\0';
++		}
++		struct attrlist a = *al;
++		error = getattrlistat_internal(vfs_context_current(), CAST_USER_ADDR_T(buf), &a,
++		    CAST_USER_ADDR_T(uap->attributeBuffer), uap->bufferSize,
++		    (uint64_t)uap->options & ~(uint64_t)FSOPT_NOFOLLOW,
++		    IS_64BIT_PROCESS(current_proc()) ? UIO_USERSPACE64 : UIO_USERSPACE32,
++		    UIO_SYSSPACE, AT_FDCWD);
++		if (error == 0) {
++			q2q_trace_path("getattrlist-fsid-fallback", CAST_USER_ADDR_T(uap->path), 0, 0, 0, 0);
++		}
++	}
++	zfree(ZV_NAMEI, buf);
++	return error;
++}
++
 +/* q2q: traced entry (boot-arg q2qtrace=NAME) */
 +int
 +getattrlist(proc_t p, struct getattrlist_args *uap, int32_t *retval)
 +{
 +	int q2q_error = q2q_getattrlist_real(p, uap, retval);
-+	{ struct attrlist q2q_al = { 0 }; if (q2q_trace_on() && copyin(uap->alist, &q2q_al, sizeof(q2q_al)) == 0) { q2q_trace_path("getattrlist", CAST_USER_ADDR_T(uap->path), q2q_al.commonattr, q2q_al.volattr, q2q_error, 0); } }
++	{ struct attrlist q2q_al = { 0 }; if (copyin(uap->alist, &q2q_al, sizeof(q2q_al)) == 0) { if (q2q_trace_on()) { q2q_trace_path("getattrlist", CAST_USER_ADDR_T(uap->path), q2q_al.commonattr, q2q_al.volattr, q2q_error, 0); } q2q_error = q2q_getattrlist_fsid_fallback(uap, &q2q_al, q2q_error); } }
 +	return q2q_error;
 +}
 +
