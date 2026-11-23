@@ -9,15 +9,16 @@ q2qtouchdelay, q2qtouchdiv, q2qtmx, q2qtmy, q2qtswap, q2qtfx, q2qtfy.
 
 ---
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 6630131..dd5f0af 100644
+index 6630131..5055806 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -108,6 +108,8 @@ bsd/dev/sweet_ufs.c			standard
+@@ -108,6 +108,9 @@ bsd/dev/sweet_ufs.c			standard
  bsd/dev/sweet_sample.c			standard
  bsd/dev/sweet_keys.c			standard
  bsd/dev/sweet_touch.c			standard
 +bsd/dev/q2q_touch.c			standard
 +bsd/dev/q2q_keys.c			standard
++bsd/dev/q2q_seed.c			standard
  bsd/dev/sweet_rpmh.c			standard
  bsd/dev/sweet_spmi.c			standard
  bsd/dev/sweet_usb.c			standard
@@ -253,6 +254,118 @@ index 0000000..975b29e
 +	}
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/q2q_seed.c b/bsd/dev/q2q_seed.c
+new file mode 100644
+index 0000000..53b0980
+--- /dev/null
++++ b/bsd/dev/q2q_seed.c
+@@ -0,0 +1,106 @@
++/*
++ * q2q file seeds (2026-11-23). Writes small configuration files onto the iOS root at boot,
++ * so a tweak does not need a 16 GB userdata reflash. A kernel thread waits for the root
++ * vnode, then creates each file that does not exist yet (owner mobile 501:501, mode 0600).
++ *
++ * Seed 1, status bar: with the presented display at the inner panel's own size
++ * (sweetfb_lw/lh 1767x2208) UIKit finds no status bar layout for the screen and draws its red
++ * placeholder bar. _UIStatusBarGetVisualProviderClassForScreen (UIKitCore 0x1891aaa80) first
++ * reads UIStatusBarVisualProviderClassName from the com.apple.UIKit defaults suite and, if it
++ * names a provider class, uses that ("WARNING: Using overridden status bar visual provider
++ * class"). Seed /var/mobile/Library/Preferences/com.apple.UIKit.plist with it.
++ *
++ * Boot-args: q2qseed=0 off; q2qsbclass=NAME provider class (default
++ * _UIStatusBarVisualProvider_Phone); q2qseedforce=1 rewrites files that already exist.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/vnode.h>
++#include <sys/fcntl.h>
++#include <sys/kauth.h>
++#include <sys/kernel.h>
++#include <kern/thread.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++
++extern vnode_t rootvnode;
++extern void sweet_fb_diag(unsigned line, const char *text);
++
++void q2q_seed_init(void);
++
++#define Q2Q_MOBILE 501
++
++static int
++q2q_seed_write(const char *path, const char *data, size_t len, int force)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int flags = O_CREAT | FWRITE | O_NOFOLLOW | (force ? O_TRUNC : O_EXCL);
++	int error = vnode_open(path, flags, 0600, 0, &vp, ctx);
++	if (error != 0) {
++		return error;           /* EEXIST: already there, leave it */
++	}
++	error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)data, (int)len, 0, UIO_SYSSPACE,
++	    IO_NODELOCKED | IO_UNIT, vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx));
++	if (error == 0) {
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_SET(&va, va_uid, Q2Q_MOBILE);
++		VATTR_SET(&va, va_gid, Q2Q_MOBILE);
++		VATTR_SET(&va, va_mode, 0600);
++		error = vnode_setattr(vp, &va, ctx);
++	}
++	(void)vnode_close(vp, FWRITE, ctx);
++	return error;
++}
++
++static void
++q2q_seed_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	/* wait (up to ~2 min) for the root file system */
++	for (int i = 0; i < 1200 && rootvnode == NULLVP; i++) {
++		delay(100 * 1000);      /* 100 ms; long delays block the thread */
++	}
++	if (rootvnode == NULLVP) {
++		sweet_fb_diag(48, "SEED no root");
++		return;
++	}
++	delay(500 * 1000);
++	int force = 0;
++	(void)PE_parse_boot_argn("q2qseedforce", &force, sizeof(force));
++	char cls[64] = "_UIStatusBarVisualProvider_Phone";
++	(void)PE_parse_boot_argn("q2qsbclass", cls, sizeof(cls));
++
++	char plist[512];
++	int n = snprintf(plist, sizeof(plist),
++	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
++	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\">\n<dict>\n"
++	    "\t<key>UIStatusBarVisualProviderClassName</key>\n\t<string>%s</string>\n"
++	    "</dict>\n</plist>\n", cls);
++	int e = (n > 0 && n < (int)sizeof(plist)) ?
++	    q2q_seed_write("/private/var/mobile/Library/Preferences/com.apple.UIKit.plist",
++	    plist, (size_t)n, force) : EINVAL;
++	char line[40];
++	snprintf(line, sizeof(line), "SEED uikit %s", e == 0 ? "written" : e == EEXIST ? "exists" : "err");
++	sweet_fb_diag(48, line);
++	printf("q2q seed: com.apple.UIKit.plist (%s): %d\n", cls, e);
++}
++
++void
++q2q_seed_init(void)
++{
++	int on = 1;
++	(void)PE_parse_boot_argn("q2qseed", &on, sizeof(on));
++	if (!on) {
++		return;
++	}
++	thread_t t;
++	if (kernel_thread_start(q2q_seed_thread, NULL, &t) == KERN_SUCCESS) {
++		thread_deallocate(t);
++	}
++}
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
 index 0000000..8a88ae1
@@ -1751,24 +1864,26 @@ index 0000000..8a88ae1
 +}
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
-index 6b926fe..7666884 100644
+index 6b926fe..045b574 100644
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -52,6 +52,8 @@ static void sweet_log_start(void);
+@@ -52,6 +52,9 @@ static void sweet_log_start(void);
  extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
 +extern void q2q_touch_init(void);
 +extern void q2q_keys_init(void);
++extern void q2q_seed_init(void);
  extern void sweet_usb_probe(void);
  
  #define REG_CAP         0x00
-@@ -659,6 +661,8 @@ sweet_ufs_init(void)
+@@ -659,6 +662,9 @@ sweet_ufs_init(void)
  	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
 +	q2q_touch_init();     /* q2q: Fold3 touch, inner (SPI) and cover (I2C) */
 +	q2q_keys_init();      /* q2q: Fold3 power / volume buttons (PMK8350, PM8350) */
++	q2q_seed_init();      /* q2q: config files onto the iOS root (status bar) */
  	sweet_usb_probe();
  	return 0;
  }
