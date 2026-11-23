@@ -255,10 +255,10 @@ index 0000000..975b29e
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..9cf9ad9
+index 0000000..8a88ae1
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1482 @@
+@@ -0,0 +1,1491 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -1514,7 +1514,7 @@ index 0000000..9cf9ad9
 +	qt_cv.int_pin = PIN_CT_INT;
 +	qt_cv.i2c = qt_cv.cover = true;
 +	sweet_fb_diag_stage = 1;
-+	qt_diag(DL_TITLE, "Q2Q TOUCH V6 DUO");
++	qt_diag(DL_TITLE, "Q2Q TOUCH V8 DUO");
 +	snprintf(b, sizeof b, "WAIT %uS DIV %u", delay_s, div);
 +	qt_diag(DL_STEP, b);
 +	qt_sleep_ms(delay_s * 1000u);
@@ -1658,8 +1658,17 @@ index 0000000..9cf9ad9
 +			if (pressed != 0) {
 +				c->press_us = now;
 +			}
++			/*
++			 * V8 (2026-11-23 on the device: folded, cover taps did nothing). A tap on the
++			 * folded cover also presses the inner halves together; the inner side is polled
++			 * first, took ownership, and the real cover press then fell inside the 250 ms
++			 * window. The cover therefore wins ties: it may take over from the inner side
++			 * even within the window. The inner side still cannot steal back within 250 ms.
++			 */
++			bool cover_tie = c->cover && qt_owner != NULL && !qt_owner->cover;
 +			if (pressed != 0 && qt_owner != c && allowed &&
-+			    (qt_owner == NULL || now - qt_owner->press_us > 250000u || qt_fold_mode != 0)) {
++			    (qt_owner == NULL || now - qt_owner->press_us > 250000u || qt_fold_mode != 0 ||
++			     cover_tie)) {
 +				if (qt_owner != NULL && qt_owner->active != 0) {
 +					qt_report(qt_owner, 0);    /* lift the old side's fingers */
 +				}
