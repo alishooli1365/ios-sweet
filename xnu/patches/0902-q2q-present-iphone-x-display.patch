@@ -7,11 +7,14 @@ panel and backboardd kept asking for AppleM2ScalerCSCDriver. Present 1125x2436 w
 sweetfb_native is not set; the swap copy clips on all edges (centered, cropped 334 rows
 top and bottom on q2q).
 
+Boot-args sweetfb_lw / sweetfb_lh (2026-11-23) present another logical size instead, to
+try filling the inner panel (e.g. 1768x2208) without a kernel rebuild.
+
 ---
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -170,7 +170,7 @@
+@@ -170,9 +170,19 @@
  	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
  	fLogicalW = fWidth;
  	fLogicalH = fHeight;
@@ -20,3 +23,15 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		fLogicalW = SWEET_FB_LOGICAL_W;
  		fLogicalH = SWEET_FB_LOGICAL_H;
  	}
++	{
++		/* q2q: sweetfb_lw / sweetfb_lh present another logical display size */
++		uint32_t q2q_lw = 0, q2q_lh = 0;
++		(void)PE_parse_boot_argn("sweetfb_lw", &q2q_lw, sizeof(q2q_lw));
++		(void)PE_parse_boot_argn("sweetfb_lh", &q2q_lh, sizeof(q2q_lh));
++		if (q2q_lw >= 320 && q2q_lw <= 4000 && q2q_lh >= 320 && q2q_lh <= 4000) {
++			fLogicalW = q2q_lw;
++			fLogicalH = q2q_lh;
++		}
++	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
