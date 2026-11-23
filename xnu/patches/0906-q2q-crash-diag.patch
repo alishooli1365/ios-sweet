@@ -1,0 +1,78 @@
+From: q2q port
+Subject: [PATCH] q2q: crash summary of one process in the diagnostic bar (q2qcrash)
+
+sweet_crash_log also draws CR/PC/LR/MH/B0..B9 (unslid) for the process named by
+boot-arg q2qcrash (default Preferences) on q2q diag lines 60..75 (sweetfb_diag=1).
+
+---
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index a20a764..1abff2f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -835,6 +835,58 @@ exception_triage(
+ void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+ static void sweet_crash_strings(const char *name);
+ 
++/*
++ * q2q (2026-11-23): Settings keeps dying; the console CRASH lines are too small to read on a
++ * phone video. For the process named by boot-arg q2qcrash (default "Preferences") draw a short
++ * summary in the q2q diagnostic bar (big font; needs sweetfb_diag=1 and the black bars).
++ * Shared-cache addresses are shown unslid (minus sr_slide) so they resolve with ipsw a2s.
++ */
++extern void sweet_fb_diag(unsigned line, const char *text);
++static void q2q_crash_diag(const char *name, int sig, arm_saved_state_t *ss, uint64_t slide,
++    uint64_t mh);
++
++static void
++q2q_crash_diag(const char *name, int sig, arm_saved_state_t *ss, uint64_t slide, uint64_t mh)
++{
++	static char want[32];
++	static int init;
++	if (!init) {
++		init = 1;
++		if (!PE_parse_boot_argn("q2qcrash", want, sizeof(want))) {
++			strlcpy(want, "Preferences", sizeof(want));
++		}
++	}
++	if (strncmp(name, want, sizeof(want)) != 0) {
++		return;
++	}
++	char l[40];
++	unsigned ln = 60;
++	snprintf(l, sizeof(l), "CR %.12s s%d", name, sig);
++	sweet_fb_diag(ln++, l);
++	snprintf(l, sizeof(l), "PC %llx", get_saved_state_pc(ss) - slide);
++	sweet_fb_diag(ln++, l);
++	snprintf(l, sizeof(l), "LR %llx", get_saved_state_lr(ss) - slide);
++	sweet_fb_diag(ln++, l);
++	snprintf(l, sizeof(l), "MH %llx", mh);
++	sweet_fb_diag(ln++, l);
++	uint64_t fp = get_saved_state_fp(ss);
++	for (int i = 0; i < 10 && fp != 0 && (fp & 7) == 0; i++) {
++		uint64_t frame[2];
++		if (copyin((user_addr_t)fp, frame, sizeof(frame)) != 0) {
++			break;
++		}
++		snprintf(l, sizeof(l), "B%d %llx", i, frame[1] - slide);
++		sweet_fb_diag(ln++, l);
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	for (; ln < 76; ln++) {
++		sweet_fb_diag(ln, "");
++	}
++}
++
+ void
+ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+ {
+@@ -872,6 +924,7 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 		fp = frame[0];
+ 	}
+ 	printf("%s\n", line);
++	q2q_crash_diag(name, sig, ss, slide, mh);   /* q2q: big-font summary */
+ 
+ 	if (sig == 11 || sig == 10) {
+ 		/* Which mapping the faulting address is in, or which two it falls between. */
