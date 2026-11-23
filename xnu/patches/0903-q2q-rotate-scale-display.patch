@@ -10,7 +10,7 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -51,6 +51,511 @@
+@@ -51,6 +51,541 @@
  #include <kern/clock.h>
  #include <sys/proc.h>
  
@@ -135,11 +135,14 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	uint32_t fbW, fbH, fbRowBytes;  /* panel scan */
 +	uint32_t pw, ph;                /* portrait view = fbH x fbW */
 +	uint32_t lw, lh;                /* logical display */
-+	uint32_t num, den;              /* scale = num / den */
++	uint32_t num, den;              /* x scale = num / den */
++	uint32_t ynum, yden;            /* y scale (equal to x unless stretched) */
 +	uint32_t ox, oy, dw, dh;        /* scaled image inside the view */
 +	uint16_t utab[SWEET_FB_ROT_MAX]; /* view px -> logical x, or NONE */
 +	uint16_t vtab[SWEET_FB_ROT_MAX]; /* view py -> logical y, or NONE */
 +};
++
++static void sweet_fb_rot_tables(struct sweet_fb_rot *r);
 +
 +static int
 +sweet_fb_rot_setup(struct sweet_fb_rot *r, uint32_t rot, uint32_t fbW, uint32_t fbH,
@@ -163,8 +166,22 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	} else {
 +		r->num = r->ph; r->den = lh;    /* height-limited (q2q: 2208 / 2436) */
 +	}
++	r->ynum = r->num; r->yden = r->den;
++	sweet_fb_rot_tables(r);
++	r->rot = rot;
++	return 1;
++}
++
++/*
++ * Image size, centering and lookup tables from the x and y scales. Both tables span the
++ * full 4096 entries so out-of-range view positions read as NONE.
++ */
++static void
++sweet_fb_rot_tables(struct sweet_fb_rot *r)
++{
++	uint32_t lw = r->lw, lh = r->lh;
 +	r->dw = (uint32_t)((uint64_t)lw * r->num / r->den);
-+	r->dh = (uint32_t)((uint64_t)lh * r->num / r->den);
++	r->dh = (uint32_t)((uint64_t)lh * r->ynum / r->yden);
 +	if (r->dw > r->pw) {
 +		r->dw = r->pw;
 +	}
@@ -186,15 +203,28 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	for (uint32_t py = 0; py < SWEET_FB_ROT_MAX; py++) {
 +		uint32_t v = SWEET_FB_ROT_NONE;
 +		if (py >= r->oy && py < r->oy + r->dh) {
-+			v = (uint32_t)((uint64_t)(py - r->oy) * r->den / r->num);
++			v = (uint32_t)((uint64_t)(py - r->oy) * r->yden / r->ynum);
 +			if (v >= lh) {
 +				v = SWEET_FB_ROT_NONE;
 +			}
 +		}
 +		r->vtab[py] = (uint16_t)v;
 +	}
-+	r->rot = rot;
-+	return 1;
++}
++
++/*
++ * Stretch to fill the whole view (boot-args sweetfb_fill / sweetfb_cfill, 2026-11-23): x and
++ * y scale separately, no black bars, the aspect is not kept. Call after a successful setup.
++ */
++static void
++sweet_fb_rot_stretch(struct sweet_fb_rot *r)
++{
++	if (r->rot == 0) {
++		return;
++	}
++	r->num = r->pw; r->den = r->lw;
++	r->ynum = r->ph; r->yden = r->lh;
++	sweet_fb_rot_tables(r);
 +}
 +
 +/* Black panel (volatile 32-bit stores: no DC ZVA on the uncached panel mapping). */
@@ -349,7 +379,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	int64_t px = (int64_t)(((uint64_t)fx16 * r->pw) >> 16);
 +	int64_t py = (int64_t)(((uint64_t)fy16 * r->ph) >> 16);
 +	int64_t u = (px - (int64_t)r->ox) * r->den / r->num;
-+	int64_t v = (py - (int64_t)r->oy) * r->den / r->num;
++	int64_t v = (py - (int64_t)r->oy) * r->yden / r->ynum;
 +	int inside = 1;
 +	if (px < (int64_t)r->ox || u < 0) {
 +		u = 0; inside = 0;
@@ -384,8 +414,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	uint32_t vy0 = (uint32_t)ly, vy1 = (uint32_t)(ly + h);
 +	uint32_t px0 = r->ox + (uint32_t)((uint64_t)ux0 * r->num / r->den);
 +	uint32_t px1 = r->ox + (uint32_t)(((uint64_t)ux1 * r->num + r->den - 1) / r->den);
-+	uint32_t py0 = r->oy + (uint32_t)((uint64_t)vy0 * r->num / r->den);
-+	uint32_t py1 = r->oy + (uint32_t)(((uint64_t)vy1 * r->num + r->den - 1) / r->den);
++	uint32_t py0 = r->oy + (uint32_t)((uint64_t)vy0 * r->ynum / r->yden);
++	uint32_t py1 = r->oy + (uint32_t)(((uint64_t)vy1 * r->ynum + r->yden - 1) / r->yden);
 +	if (px1 > r->ox + r->dw) {
 +		px1 = r->ox + r->dw;
 +	}
@@ -522,7 +552,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
  	kSweetFBSwapBegin               = 4,
-@@ -176,6 +681,46 @@
+@@ -176,6 +711,56 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -535,6 +565,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		}
 +		if (sweet_fb_rot_setup(&sweet_fb_rot_state, rot, fWidth, fHeight, fRowBytes,
 +		    fLogicalW, fLogicalH)) {
++			uint32_t fill = 0;
++			(void)PE_parse_boot_argn("sweetfb_fill", &fill, sizeof(fill));
++			if (fill) {
++				sweet_fb_rot_stretch(&sweet_fb_rot_state);   /* no bars, aspect not kept */
++			}
 +			IOLog("SWEET FB: rotation %u, scale %u/%u, image %ux%u at %u,%u\n", rot,
 +			    sweet_fb_rot_state.num, sweet_fb_rot_state.den, sweet_fb_rot_state.dw,
 +			    sweet_fb_rot_state.dh, sweet_fb_rot_state.ox, sweet_fb_rot_state.oy);
@@ -558,6 +593,11 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		if (sweet_fb_cover_map != NULL &&
 +		    sweet_fb_rot_setup(&sweet_fb_rot_cover, 2, cw, ch, fRowBytes, fLogicalW, fLogicalH)) {
 +			sweet_fb_cover_pixels = (uintptr_t)sweet_fb_cover_map->getVirtualAddress();
++			uint32_t cfill = 0;
++			(void)PE_parse_boot_argn("sweetfb_cfill", &cfill, sizeof(cfill));
++			if (cfill) {
++				sweet_fb_rot_stretch(&sweet_fb_rot_cover);   /* cover: fill, aspect not kept */
++			}
 +			IOLog("SWEET FB: duo: cover %ux%u at 0x%llx (row %u), image %ux%u at %u,%u\n", cw, ch,
 +			    cpa, cy, sweet_fb_rot_cover.dw, sweet_fb_rot_cover.dh, sweet_fb_rot_cover.ox,
 +			    sweet_fb_rot_cover.oy);
@@ -569,7 +609,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -212,6 +757,9 @@
+@@ -212,6 +797,9 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -579,7 +619,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -238,6 +786,15 @@
+@@ -238,6 +826,15 @@
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -595,7 +635,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  		return;
-@@ -359,6 +916,48 @@
+@@ -359,6 +956,48 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
