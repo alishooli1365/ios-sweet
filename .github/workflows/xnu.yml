@@ -36,7 +36,7 @@ jobs:
   build:
     # q2q: macos-14 was retired (Nov 2026); macos-15 ships Xcode 16.0-16.4 only.
     # Xcode 16's iig emits IORPC.kernelContent (absent in xnu-8796): see q2q compat patch.
-    runs-on: macos-15
+    runs-on: macos-15-intel
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
