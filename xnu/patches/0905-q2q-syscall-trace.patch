@@ -1,0 +1,217 @@
+From: q2q port
+Subject: [PATCH] q2q: trace volume-info syscalls of one process (boot-arg q2qtrace)
+
+getattrlist / statfs64 / fstatfs64 / getfsstat64 of the process named by q2qtrace=NAME
+print 'Q2QT n call path masks err ret' (max 400 lines). Off without the boot-arg.
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea13696..43f4882 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -139,6 +139,7 @@ bsd/vfs/vfs_lookup.c			standard
+ bsd/vfs/vfs_quota.c			optional quota
+ bsd/vfs/vfs_subr.c			standard
+ bsd/vfs/vfs_syscalls.c			standard
++bsd/vfs/q2q_trace.c			standard
+ bsd/vfs/vfs_support.c			standard
+ bsd/vfs/vfs_utfconv.c			standard
+ bsd/vfs/vfs_unicode.c			standard
+diff --git a/bsd/vfs/q2q_trace.c b/bsd/vfs/q2q_trace.c
+new file mode 100644
+index 0000000..15a1f18
+--- /dev/null
++++ b/bsd/vfs/q2q_trace.c
+@@ -0,0 +1,58 @@
++/*
++ * q2q syscall trace (2026-11-23, Settings crash): for the process named by boot-arg
++ * q2qtrace=NAME, print every volume-information syscall (getattrlist, statfs64, fstatfs64,
++ * getfsstat64) with its path / fd, attribute masks and result, as "Q2QT ..." kernel lines.
++ * Shown on the panel with sweetfb_noconsole=0. At most Q2Q_TRACE_MAX lines per boot.
++ *
++ * Why: Settings (Preferences) dies in PodcastsUI on a force-unwrapped
++ * URL.volumeTotalCapacity. CoreServicesInternal gets that from getattrlist(ATTR_CMN_FSID)
++ * on the URL's path, then getmntinfo_r_np() matched by fsid; either step failing gives nil.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++
++#define Q2Q_TRACE_MAX 400
++
++int q2q_trace_on(void);
++void q2q_trace_path(const char *what, user_addr_t path, uint32_t a, uint32_t b, int error, int ret);
++
++static char q2q_trace_name[MAXCOMLEN + 1];
++static int q2q_trace_state;     /* 0 = boot-arg not read yet, 1 = off, 2 = on */
++static int q2q_trace_lines;
++
++int
++q2q_trace_on(void)
++{
++	if (q2q_trace_state == 0) {
++		q2q_trace_state = 1;
++		if (PE_parse_boot_argn("q2qtrace", q2q_trace_name, sizeof(q2q_trace_name)) &&
++		    q2q_trace_name[0] != '\0') {
++			q2q_trace_state = 2;
++		}
++	}
++	if (q2q_trace_state != 2 || q2q_trace_lines >= Q2Q_TRACE_MAX) {
++		return 0;
++	}
++	char name[MAXCOMLEN + 1];
++	proc_selfname(name, (int)sizeof(name));
++	return strncmp(name, q2q_trace_name, sizeof(name)) == 0;
++}
++
++void
++q2q_trace_path(const char *what, user_addr_t path, uint32_t a, uint32_t b, int error, int ret)
++{
++	if (!q2q_trace_on()) {
++		return;
++	}
++	char buf[200];
++	size_t len = 0;
++	if (path == 0) {
++		strlcpy(buf, "-", sizeof(buf));
++	} else if (copyinstr(path, buf, sizeof(buf), &len) != 0) {
++		strlcpy(buf, "?", sizeof(buf));
++	}
++	q2q_trace_lines++;
++	printf("Q2QT %d %s %s %x/%x err %d ret %d\n", q2q_trace_lines, what, buf, a, b, error, ret);
++}
+diff --git a/bsd/vfs/vfs_attrlist.c b/bsd/vfs/vfs_attrlist.c
+index 963acec..8c669ce 100644
+--- a/bsd/vfs/vfs_attrlist.c
++++ b/bsd/vfs/vfs_attrlist.c
+@@ -46,6 +46,8 @@
+ #include <sys/uio_internal.h>
+ #include <kern/kalloc.h>
+ #include <sys/attr.h>
++int q2q_trace_on(void);
++void q2q_trace_path(const char *what, user_addr_t path, uint32_t a, uint32_t b, int error, int ret);
+ #include <sys/sysproto.h>
+ #include <sys/xattr.h>
+ #include <sys/fsevents.h>
+@@ -3411,8 +3413,10 @@ getattrlistat_internal(vfs_context_t ctx, user_addr_t path,
+ 	return error;
+ }
+ 
++int q2q_getattrlist_real(proc_t p, struct getattrlist_args *uap, int32_t *retval);
++
+ int
+-getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
++q2q_getattrlist_real(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
+ {
+ 	enum uio_seg segflg;
+ 	struct attrlist al;
+@@ -3434,6 +3438,15 @@ getattrlist(proc_t p, struct getattrlist_args *uap, __unused int32_t *retval)
+ 	           (uint64_t)uap->options, segflg, segflg, AT_FDCWD);
+ }
+ 
++/* q2q: traced entry (boot-arg q2qtrace=NAME) */
++int
++getattrlist(proc_t p, struct getattrlist_args *uap, int32_t *retval)
++{
++	int q2q_error = q2q_getattrlist_real(p, uap, retval);
++	{ struct attrlist q2q_al = { 0 }; if (q2q_trace_on() && copyin(uap->alist, &q2q_al, sizeof(q2q_al)) == 0) { q2q_trace_path("getattrlist", CAST_USER_ADDR_T(uap->path), q2q_al.commonattr, q2q_al.volattr, q2q_error, 0); } }
++	return q2q_error;
++}
++
+ int
+ getattrlistat(proc_t p, struct getattrlistat_args *uap, __unused int32_t *retval)
+ {
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..6c3c995 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -80,6 +80,8 @@
+ #include <sys/stat.h>
+ #include <sys/vnode_internal.h>
+ #include <sys/mount_internal.h>
++int q2q_trace_on(void);
++void q2q_trace_path(const char *what, user_addr_t path, uint32_t a, uint32_t b, int error, int ret);
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/uio_internal.h>
+@@ -3534,8 +3536,10 @@ vfs_get_statfs64(struct mount *mp, struct statfs64 *sfs)
+ /*
+  * Get file system statistics in 64-bit mode
+  */
++int q2q_statfs64_real(struct proc *p, struct statfs64_args *uap, int32_t *retval);
++
+ int
+-statfs64(__unused struct proc *p, struct statfs64_args *uap, __unused int32_t *retval)
++q2q_statfs64_real(__unused struct proc *p, struct statfs64_args *uap, __unused int32_t *retval)
+ {
+ 	struct mount *mp;
+ 	int error;
+@@ -3592,11 +3596,22 @@ out:
+ 	return error;
+ }
+ 
++/* q2q: traced entry (boot-arg q2qtrace=NAME) */
++int
++statfs64(struct proc *p, struct statfs64_args *uap, int32_t *retval)
++{
++	int q2q_error = q2q_statfs64_real(p, uap, retval);
++	q2q_trace_path("statfs64", uap->path, 0, 0, q2q_error, 0);
++	return q2q_error;
++}
++
+ /*
+  * Get file system statistics in 64-bit mode
+  */
++int q2q_fstatfs64_real(struct proc *p, struct fstatfs64_args *uap, int32_t *retval);
++
+ int
+-fstatfs64(__unused struct proc *p, struct fstatfs64_args *uap, __unused int32_t *retval)
++q2q_fstatfs64_real(__unused struct proc *p, struct fstatfs64_args *uap, __unused int32_t *retval)
+ {
+ 	struct vnode *vp;
+ 	struct mount *mp;
+@@ -3649,6 +3664,15 @@ out:
+ 	return error;
+ }
+ 
++/* q2q: traced entry (boot-arg q2qtrace=NAME) */
++int
++fstatfs64(struct proc *p, struct fstatfs64_args *uap, int32_t *retval)
++{
++	int q2q_error = q2q_fstatfs64_real(p, uap, retval);
++	q2q_trace_path("fstatfs64", 0, (uint32_t)uap->fd, 0, q2q_error, 0);
++	return q2q_error;
++}
++
+ struct getfsstat_struct {
+ 	user_addr_t     sfsp;
+ 	user_addr_t     *mp;
+@@ -3890,8 +3914,10 @@ getfsstat64_callback(mount_t mp, void * arg)
+ /*
+  * Get statistics on all file systems in 64 bit mode.
+  */
++int q2q_getfsstat64_real(proc_t p, struct getfsstat64_args *uap, int *retval);
++
+ int
+-getfsstat64(__unused proc_t p, struct getfsstat64_args *uap, int *retval)
++q2q_getfsstat64_real(__unused proc_t p, struct getfsstat64_args *uap, int *retval)
+ {
+ 	user_addr_t sfsp;
+ 	int count, maxcount;
+@@ -3924,6 +3950,15 @@ getfsstat64(__unused proc_t p, struct getfsstat64_args *uap, int *retval)
+ 	return 0;
+ }
+ 
++/* q2q: traced entry (boot-arg q2qtrace=NAME) */
++int
++getfsstat64(proc_t p, struct getfsstat64_args *uap, int *retval)
++{
++	int q2q_error = q2q_getfsstat64_real(p, uap, retval);
++	q2q_trace_path("getfsstat64", 0, (uint32_t)uap->bufsize, (uint32_t)uap->flags, q2q_error, *retval);
++	return q2q_error;
++}
++
+ /*
+  * gets the associated vnode with the file descriptor passed.
+  * as input
