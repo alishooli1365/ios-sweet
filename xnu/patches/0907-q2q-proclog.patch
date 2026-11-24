@@ -1,0 +1,142 @@
+From: q2q port
+Subject: [PATCH] q2q: app start/stop log in the diagnostic bar (q2qproc)
+
+exec and exit (signal / status / exit reason) of the processes named by q2qproc
+(default: Preferences, AppStore, Photos, Phone, Messages, Safari, SpringBoard,
+backboardd) as big-font lines 50..59 of the q2q diagnostic bar.
+
+---
+diff --git a/bsd/conf/files b/bsd/conf/files
+index ea13696..4c455eb 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -442,6 +442,7 @@ bsd/kern/kern_event.c			standard
+ bsd/kern/kern_control.c			optional networking
+ bsd/kern/kern_exec.c			standard
+ bsd/kern/kern_exit.c			standard
++bsd/kern/q2q_proclog.c			standard
+ bsd/kern/kern_ktrace.c			standard
+ bsd/kern/kern_lockf.c			standard
+ bsd/kern/kern_fork.c			standard
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 68612db..cbd8f4f 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -7414,6 +7414,10 @@ process_signature(proc_t p, struct image_params *imgp)
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			{
++				extern void q2q_proclog(char, const char *, int, uint32_t, uint64_t);
++				q2q_proclog('E', p->p_name, 0, 0, 0);   /* q2q: app start/stop log */
++			}
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index fde499c..da1fabc 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1848,6 +1848,15 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* q2q: app start/stop log (every exit, with its exit reason) */
++		extern void q2q_proclog(char, const char *, int, uint32_t, uint64_t);
++		q2q_proclog('X', p->p_comm, rv,
++		    PROC_HAS_EXITREASON(p) ? p->p_exit_reason->osr_namespace : 0,
++		    PROC_HAS_EXITREASON(p) ? p->p_exit_reason->osr_code : 0);
++	}
++#endif
+ 
+ 	/*
+ 	 * Generate a corefile/crashlog if:
+diff --git a/bsd/kern/q2q_proclog.c b/bsd/kern/q2q_proclog.c
+new file mode 100644
+index 0000000..481b863
+--- /dev/null
++++ b/bsd/kern/q2q_proclog.c
+@@ -0,0 +1,81 @@
++/*
++ * q2q app start/stop log (2026-11-24). Tapping Settings shows nothing and no CRASH line is
++ * printed, so the app is either never started or ends without a core-dumping signal (killed by
++ * RunningBoard / SpringBoard, exit reason). Every exec and every exit of a process named in
++ * boot-arg q2qproc (comma separated, default below) becomes one line in the q2q diagnostic bar
++ * (sweet_fb_diag lines 50..59, newest last, big font):
++ *   "n E name"                      exec
++ *   "n X name s9 r15/0x3"           killed by signal 9, exit reason namespace 15 code 0x3
++ *   "n X name e1"                   exited with status 1
++ * q2qproc=* logs every process.
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/wait.h>
++#include <pexpert/pexpert.h>
++
++extern void sweet_fb_diag(unsigned line, const char *text);
++
++void q2q_proclog(char tag, const char *name, int rv, uint32_t ns, uint64_t code);
++
++#define Q2Q_PL_FIRST 50u
++#define Q2Q_PL_LINES 10u
++
++static char q2q_pl_names[200];
++static int q2q_pl_state;           /* 0 unread, 1 list, 2 all */
++static char q2q_pl_ring[Q2Q_PL_LINES][40];
++static uint32_t q2q_pl_seq;
++static int q2q_pl_head;
++
++static int
++q2q_pl_match(const char *name)
++{
++	if (q2q_pl_state == 0) {
++		strlcpy(q2q_pl_names, "Preferences,AppStore,MobileSlideShow,MobilePhone,MobileSMS,"
++		    "MobileSafari,SpringBoard,backboardd", sizeof(q2q_pl_names));
++		(void)PE_parse_boot_argn("q2qproc", q2q_pl_names, sizeof(q2q_pl_names));
++		q2q_pl_state = strcmp(q2q_pl_names, "*") == 0 ? 2 : 1;
++	}
++	if (q2q_pl_state == 2) {
++		return 1;
++	}
++	size_t n = strlen(name);
++	const char *s = q2q_pl_names;
++	while (*s != '\0') {
++		const char *e = strchr(s, ',');
++		size_t len = e ? (size_t)(e - s) : strlen(s);
++		if (len == n && strncmp(s, name, n) == 0) {
++			return 1;
++		}
++		if (e == NULL) {
++			break;
++		}
++		s = e + 1;
++	}
++	return 0;
++}
++
++void
++q2q_proclog(char tag, const char *name, int rv, uint32_t ns, uint64_t code)
++{
++	if (name == NULL || !q2q_pl_match(name)) {
++		return;
++	}
++	char l[40];
++	uint32_t seq = ++q2q_pl_seq;
++	if (tag == 'E') {
++		snprintf(l, sizeof(l), "%u E %.24s", seq, name);
++	} else if (WIFSIGNALED(rv)) {
++		snprintf(l, sizeof(l), "%u X %.14s s%d r%u/0x%llx", seq, name, WTERMSIG(rv), ns,
++		    (unsigned long long)code);
++	} else {
++		snprintf(l, sizeof(l), "%u X %.14s e%d r%u/0x%llx", seq, name, WEXITSTATUS(rv), ns,
++		    (unsigned long long)code);
++	}
++	strlcpy(q2q_pl_ring[q2q_pl_head], l, sizeof(q2q_pl_ring[0]));
++	q2q_pl_head = (q2q_pl_head + 1) % (int)Q2Q_PL_LINES;
++	for (uint32_t i = 0; i < Q2Q_PL_LINES; i++) {
++		sweet_fb_diag(Q2Q_PL_FIRST + i, q2q_pl_ring[(q2q_pl_head + (int)i) % (int)Q2Q_PL_LINES]);
++	}
++	printf("Q2QPL %s\n", l);
++}

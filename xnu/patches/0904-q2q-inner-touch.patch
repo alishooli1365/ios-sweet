@@ -368,10 +368,10 @@ index 0000000..53b0980
 +}
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..8a88ae1
+index 0000000..83ab714
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1491 @@
+@@ -0,0 +1,1509 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -966,6 +966,8 @@ index 0000000..8a88ae1
 +};
 +static struct qt_ctl qt_in, qt_cv;
 +static struct qt_ctl *qt_owner;   /* side whose contacts go to HID (latest new press) */
++static uint32_t g80_seen, g26_seen;          /* fold pins: levels seen since boot (bit per level) */
++static uint32_t cv_press_g80 = 9, cv_press_g26 = 9;  /* pin levels at the latest cover press */
 +/* fold sensor: q2qfold=0 off, 80 = TLMM gpio80 (folder_hall), 26 = gpio26 (hall);
 + * q2qfoldlvl = level that means folded (default 1) */
 +static uint32_t qt_fold_mode, qt_fold_level = 1;
@@ -1730,6 +1732,13 @@ index 0000000..8a88ae1
 +		uint64_t now = qt_now_us();
 +		uint32_t g80 = qt_rd(qt.tlmm, TLMM_IO(PIN_FOLDER_HALL)) & 1u;
 +		uint32_t g26 = qt_rd(qt.tlmm, TLMM_IO(PIN_HALL)) & 1u;
++		/*
++		 * 2026-11-24: the inner diag only shows while open, so remember every level each
++		 * pin has had since boot (bit0 = seen 0, bit1 = seen 1) and the levels it had at the
++		 * latest cover press (the phone is folded then).
++		 */
++		g80_seen |= 1u << g80;
++		g26_seen |= 1u << g26;
 +		if (qt_fold_mode != 0) {
 +			uint32_t lvl = qt_fold_mode == PIN_FOLDER_HALL ? g80 : g26;
 +			qt_folded = (lvl == (qt_fold_level & 1u));
@@ -1770,6 +1779,10 @@ index 0000000..8a88ae1
 +			}
 +			if (pressed != 0) {
 +				c->press_us = now;
++				if (c->cover) {
++					cv_press_g80 = g80;   /* folded: what the hall pins read now */
++					cv_press_g26 = g26;
++				}
 +			}
 +			/*
 +			 * V8 (2026-11-23 on the device: folded, cover taps did nothing). A tap on the
@@ -1814,6 +1827,11 @@ index 0000000..8a88ae1
 +			snprintf(b, sizeof b, "FOLD G80=%u G26=%u M%u %s", g80, g26, qt_fold_mode,
 +			    qt_fold_mode ? (qt_folded ? "CLOSED" : "OPEN") : "-");
 +			sweet_fb_diag(38, b);
++			snprintf(b, sizeof b, "SEEN G80 %s G26 %s CVP %u%u",
++			    g80_seen == 3u ? "0+1" : g80_seen == 2u ? "1" : "0",
++			    g26_seen == 3u ? "0+1" : g26_seen == 2u ? "1" : "0",
++			    cv_press_g80, cv_press_g26);
++			sweet_fb_diag(46, b);
 +			snprintf(b, sizeof b, "OWNER %s", qt_owner == &qt_cv ? "COVER" : qt_owner == &qt_in ? "INNER" : "NONE");
 +			sweet_fb_diag(39, b);
 +			/* calibration: cover lines 30..33, inner lines 34..37 */
