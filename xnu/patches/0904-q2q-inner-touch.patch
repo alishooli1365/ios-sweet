@@ -368,10 +368,10 @@ index 0000000..53b0980
 +}
 diff --git a/bsd/dev/q2q_touch.c b/bsd/dev/q2q_touch.c
 new file mode 100644
-index 0000000..83ab714
+index 0000000..ebccc5a
 --- /dev/null
 +++ b/bsd/dev/q2q_touch.c
-@@ -0,0 +1,1509 @@
+@@ -0,0 +1,1607 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) inner touchscreen for ios-sweet XNU.
 + *
@@ -397,6 +397,8 @@ index 0000000..83ab714
 +#include <kern/sched_prim.h>
 +#include <machine/machine_routines.h>
 +#include <pexpert/pexpert.h>
++#include <sys/proc_internal.h>
++#include <sys/signal.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern kern_return_t thread_terminate(thread_t);
@@ -1583,6 +1585,96 @@ index 0000000..83ab714
 +	return alive || ready;
 +}
 +
++/*
++ * Fold modes (2026-11-24, "like the iPhone Duo videos"): iOS fixes its screen size when the
++ * display server starts, so each layout change is a size switch in the framebuffer driver plus
++ * a restart of backboardd/SpringBoard ("respring"). Trigger: a deliberate tap (down and up
++ * within 30..800 ms) on the panel that does not match the current layout: cover -> mode 0
++ * (iPhone size), inner -> mode 1 (inner shape). The hall pins have not been characterised
++ * folded yet, so touch decides. At most one switch per 8 s; an inner tap needs 2 s without
++ * cover presses (pressing the folded cover can also press the inner halves).
++ * Needs q2qmodes=1 (framebuffer side); q2qautofold=0 disables the trigger.
++ */
++extern int sweet_fb_request_mode(int mode);
++extern int sweet_fb_current_mode(void);
++static uint32_t qt_autofold = 1;
++static uint64_t qt_tap_down_us[2];          /* [0] cover, [1] inner */
++static uint64_t qt_mode_last_us;
++static int qt_mode_pending = -1;
++static uint64_t qt_mode_pending_us;
++static uint32_t qt_resprings;
++
++static int
++qt_respring_cb(proc_t p, void *arg)
++{
++	int *pids = arg;
++	const char *n = proc_best_name(p);
++	if (n != NULL && (strcmp(n, "backboardd") == 0 || strcmp(n, "SpringBoard") == 0) &&
++	    pids[0] < 4) {
++		pids[1 + pids[0]++] = proc_pid(p);
++	}
++	return PROC_RETURNED;
++}
++
++/* Restart the display server and home screen; launchd starts them again. */
++static void
++qt_respring(void)
++{
++	int pids[5] = { 0 };
++	proc_iterate(PROC_ALLPROCLIST, qt_respring_cb, pids, NULL, NULL);
++	for (int i = 0; i < pids[0]; i++) {
++		proc_signal(pids[1 + i], SIGKILL);
++	}
++	qt_resprings++;
++}
++
++/* Called for each panel after its poll: was = contact mask before this poll. */
++static void
++qt_fold_tap(const struct qt_ctl *c, uint32_t was, uint64_t now)
++{
++	if (!qt_autofold || sweet_fb_current_mode() < 0) {
++		return;
++	}
++	unsigned k = c->cover ? 0u : 1u;
++	if (was == 0 && c->mask != 0) {
++		qt_tap_down_us[k] = now;
++		return;
++	}
++	if (was == 0 || c->mask != 0 || qt_tap_down_us[k] == 0) {
++		return;
++	}
++	uint64_t dur = now - qt_tap_down_us[k];
++	qt_tap_down_us[k] = 0;
++	int want = c->cover ? 0 : 1;
++	if (dur < 30000u || dur > 800000u || want == sweet_fb_current_mode() || qt_mode_pending >= 0 ||
++	    now - qt_mode_last_us < 8000000u) {
++		return;
++	}
++	if (!c->cover && (qt_cv.mask != 0 || now - qt_cv.press_us < 2000000u)) {
++		return;     /* inner halves pressed by a cover tap, not an unfold */
++	}
++	if (sweet_fb_request_mode(want) == 0) {
++		qt_mode_last_us = now;
++		qt_mode_pending = want;
++		qt_mode_pending_us = now;
++	}
++}
++
++/* Once the framebuffer has switched, respring so iOS reopens it at the new size. */
++static void
++qt_fold_poll(uint64_t now)
++{
++	if (qt_mode_pending < 0) {
++		return;
++	}
++	if (sweet_fb_current_mode() == qt_mode_pending && now - qt_mode_pending_us > 150000u) {
++		qt_mode_pending = -1;
++		qt_respring();
++	} else if (now - qt_mode_pending_us > 3000000u) {
++		qt_mode_pending = -1;   /* framebuffer never applied it */
++	}
++}
++
 +static void
 +qt_thread(void *arg, wait_result_t res)
 +{
@@ -1723,6 +1815,7 @@ index 0000000..83ab714
 +	sweet_fb_diag_stage = 8;
 +
 +	uint64_t last_draw = 0;
++	(void)PE_parse_boot_argn("q2qautofold", &qt_autofold, sizeof(qt_autofold));
 +	(void)PE_parse_boot_argn("q2qfold", &qt_fold_mode, sizeof(qt_fold_mode));
 +	(void)PE_parse_boot_argn("q2qfoldlvl", &qt_fold_level, sizeof(qt_fold_level));
 +	if (qt_fold_mode != PIN_FOLDER_HALL && qt_fold_mode != PIN_HALL) {
@@ -1739,6 +1832,7 @@ index 0000000..83ab714
 +		 */
 +		g80_seen |= 1u << g80;
 +		g26_seen |= 1u << g26;
++		qt_fold_poll(now);
 +		if (qt_fold_mode != 0) {
 +			uint32_t lvl = qt_fold_mode == PIN_FOLDER_HALL ? g80 : g26;
 +			qt_folded = (lvl == (qt_fold_level & 1u));
@@ -1765,8 +1859,10 @@ index 0000000..83ab714
 +			 * The side with the most recent NEW finger-down owns HID; a resting contact
 +			 * makes no new presses, so it never takes over.
 +			 */
++			uint32_t was_mask = c->prev;
 +			uint32_t pressed = c->mask & ~c->prev;
 +			c->prev = c->mask;
++			qt_fold_tap(c, was_mask, now);   /* q2q fold modes: deliberate tap switches layout */
 +			/*
 +			 * Fold sensor (optional, q2qfold): folded -> only the cover may own, open ->
 +			 * only the inner side. Without it: a new press takes over, except within
@@ -1832,6 +1928,8 @@ index 0000000..83ab714
 +			    g26_seen == 3u ? "0+1" : g26_seen == 2u ? "1" : "0",
 +			    cv_press_g80, cv_press_g26);
 +			sweet_fb_diag(46, b);
++			snprintf(b, sizeof b, "MODE %d RESPRING %u", sweet_fb_current_mode(), qt_resprings);
++			sweet_fb_diag(47, b);
 +			snprintf(b, sizeof b, "OWNER %s", qt_owner == &qt_cv ? "COVER" : qt_owner == &qt_in ? "INNER" : "NONE");
 +			sweet_fb_diag(39, b);
 +			/* calibration: cover lines 30..33, inner lines 34..37 */
