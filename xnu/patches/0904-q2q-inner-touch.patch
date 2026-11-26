@@ -274,10 +274,10 @@ index 0000000..ae53127
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 diff --git a/bsd/dev/q2q_seed.c b/bsd/dev/q2q_seed.c
 new file mode 100644
-index 0000000..53b0980
+index 0000000..0700f34
 --- /dev/null
 +++ b/bsd/dev/q2q_seed.c
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,113 @@
 +/*
 + * q2q file seeds (2026-11-23). Writes small configuration files onto the iOS root at boot,
 + * so a tweak does not need a 16 GB userdata reflash. A kernel thread waits for the root
@@ -355,7 +355,13 @@ index 0000000..53b0980
 +	(void)PE_parse_boot_argn("q2qsbclass", cls, sizeof(cls));
 +
 +	char plist[512];
-+	int n = snprintf(plist, sizeof(plist),
++	/* q2qsbclass=- (2026-11-26): write an empty dict, i.e. remove the override again */
++	int n = cls[0] == '-' ? snprintf(plist, sizeof(plist),
++	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
++	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++	    "<plist version=\"1.0\">\n<dict/>\n</plist>\n") :
++	    snprintf(plist, sizeof(plist),
 +	    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
 +	    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
 +	    "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
@@ -366,7 +372,8 @@ index 0000000..53b0980
 +	    q2q_seed_write("/private/var/mobile/Library/Preferences/com.apple.UIKit.plist",
 +	    plist, (size_t)n, force) : EINVAL;
 +	char line[40];
-+	snprintf(line, sizeof(line), "SEED uikit %s", e == 0 ? "written" : e == EEXIST ? "exists" : "err");
++	snprintf(line, sizeof(line), "SEED uikit %s%s", e == 0 ? "written" : e == EEXIST ? "exists" : "err",
++	    cls[0] == '-' ? " (cleared)" : "");
 +	sweet_fb_diag(48, line);
 +	printf("q2q seed: com.apple.UIKit.plist (%s): %d\n", cls, e);
 +}
