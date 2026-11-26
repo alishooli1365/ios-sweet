@@ -6,10 +6,10 @@ boot-arg q2qcrash (default Preferences) on q2q diag lines 60..75 (sweetfb_diag=1
 
 ---
 diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
-index a20a764..1abff2f 100644
+index a20a764..220ed50 100644
 --- a/osfmk/kern/exception.c
 +++ b/osfmk/kern/exception.c
-@@ -835,6 +835,58 @@ exception_triage(
+@@ -835,6 +835,60 @@ exception_triage(
  void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
  static void sweet_crash_strings(const char *name);
  
@@ -20,6 +20,7 @@ index a20a764..1abff2f 100644
 + * Shared-cache addresses are shown unslid (minus sr_slide) so they resolve with ipsw a2s.
 + */
 +extern void sweet_fb_diag(unsigned line, const char *text);
++extern void sweet_fb_hud_auto(unsigned seconds);   /* q2q info panel (2026-11-26) */
 +static void q2q_crash_diag(const char *name, int sig, arm_saved_state_t *ss, uint64_t slide,
 +    uint64_t mh);
 +
@@ -63,12 +64,13 @@ index a20a764..1abff2f 100644
 +	for (; ln < 76; ln++) {
 +		sweet_fb_diag(ln, "");
 +	}
++	sweet_fb_hud_auto(20);   /* show it over the picture in the normal build too */
 +}
 +
  void
  sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
  {
-@@ -872,6 +924,7 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+@@ -872,6 +926,7 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
  		fp = frame[0];
  	}
  	printf("%s\n", line);

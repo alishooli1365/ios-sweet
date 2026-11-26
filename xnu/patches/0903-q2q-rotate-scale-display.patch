@@ -10,7 +10,7 @@ boot-arg the copy is unchanged.
 diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -50,6 +50,767 @@
+@@ -50,6 +50,872 @@
  #include <pexpert/pexpert.h>
  #include <kern/clock.h>
  #include <sys/proc.h>
@@ -324,6 +324,48 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		out[i] = t[n - 1 - i];
 +	}
 +	return n;
++}
++
++/*
++ * Info panel (2026-11-26): one text line drawn OVER the iOS picture at view position (x0, y0),
++ * `scale` px per font pixel, on a black box one cell wider than the text, at most maxcols
++ * characters. Returns the line height used (0 when nothing was drawn).
++ */
++static uint32_t
++sweet_fb_hud_text(const struct sweet_fb_rot *r, uintptr_t fb, uint32_t x0, uint32_t y0,
++    uint32_t scale, const char *text, uint32_t maxcols)
++{
++	uint32_t n = 0;
++	while (text != NULL && text[n] != '\0' && n < maxcols) {
++		n++;
++	}
++	if (r->rot == 0 || n == 0 || scale == 0) {
++		return 0;
++	}
++	uint32_t adv = 6u * scale, lh = 8u * scale;
++	for (uint32_t y = 0; y < lh; y++) {
++		for (uint32_t x = 0; x < (n + 1) * adv; x++) {
++			sweet_fb_rot_putview(r, fb, x0 + x, y0 + y, 0);
++		}
++	}
++	for (uint32_t c = 0; c < n; c++) {
++		uint8_t ch = (uint8_t)text[c];
++		const uint8_t *g = sweet_diag_font[(ch >= 0x20 && ch < 0x80) ? ch - 0x20 : '?' - 0x20];
++		for (uint32_t gy = 0; gy < 7; gy++) {
++			for (uint32_t gx = 0; gx < 5; gx++) {
++				if (!(g[gy] & (0x10u >> gx))) {
++					continue;
++				}
++				for (uint32_t dy = 0; dy < scale; dy++) {
++					for (uint32_t dx = 0; dx < scale; dx++) {
++						sweet_fb_rot_putview(r, fb, x0 + adv / 2 + c * adv + gx * scale + dx,
++						    y0 + scale / 2 + gy * scale + dy, 0x00ffffffu);
++					}
++				}
++			}
++		}
++	}
++	return lh;
 +}
 +
 +/* Draw one text line (cleared to black first, cut at the bar width). */
@@ -775,10 +817,73 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +	}
 +	return sweet_fb_rot_view_to_hid(&sweet_fb_rot_cover, fx16, fy16, hx, hy);
 +}
++
++/*
++ * q2q info panel (2026-11-26): diagnostic lines 46..75 (fold pins, mode, seed, app
++ * start/stop log, crash summary) drawn OVER the iOS picture for a while, so they can be
++ * photographed without a special diagnostic build. Shown when a watched app exits abnormally
++ * (sweet_fb_hud_auto) or when Vol Up + Vol Down are held 1 s (sweet_fb_hud_show).
++ * Boot-args: q2qhud=0 off, q2qhudauto=0 no automatic pop-up.
++ */
++static uint64_t sweet_fb_hud_until;
++static uint32_t sweet_fb_hud_on = 1, sweet_fb_hud_autoon = 1;
++static volatile int sweet_fb_hud_redraw;
++
++extern "C" void
++sweet_fb_hud_show(unsigned seconds)
++{
++	if (!sweet_fb_hud_on) {
++		return;
++	}
++	uint64_t add = 0;
++	nanoseconds_to_absolutetime((uint64_t)seconds * NSEC_PER_SEC, &add);
++	sweet_fb_hud_until = mach_absolute_time() + add;
++	sweet_fb_hud_redraw = 1;
++}
++
++extern "C" void
++sweet_fb_hud_auto(unsigned seconds)
++{
++	if (sweet_fb_hud_autoon) {
++		sweet_fb_hud_show(seconds);
++	}
++}
++
++static void
++sweet_fb_hud_paint_one(const struct sweet_fb_rot *r, uintptr_t fb, uint32_t scale)
++{
++	uint32_t y = 140u, gap = scale * 2u;
++	y += sweet_fb_hud_text(r, fb, 30u, y, scale, "Q2Q INFO (VOL UP+DOWN)", 38u) + gap;
++	for (uint32_t dl = 46; dl < 76 && dl < SWEET_DIAG_MAX_LINES; dl++) {
++		if (sweet_fb_diag_text[dl][0] == '\0') {
++			continue;
++		}
++		y += sweet_fb_hud_text(r, fb, 30u, y, scale, sweet_fb_diag_text[dl], 38u) + gap;
++	}
++}
++
++/* Draw the panel on both screens while it is active (after each present and on request). */
++static void
++sweet_fb_hud_paint(void)
++{
++	if (sweet_fb_hud_until == 0) {
++		return;
++	}
++	if (mach_absolute_time() > sweet_fb_hud_until) {
++		sweet_fb_hud_until = 0;
++		return;
++	}
++	if (sweet_fb_rot_state.rot != 0 && sweet_fb_diag_pixels != 0) {
++		sweet_fb_hud_paint_one(&sweet_fb_rot_state, sweet_fb_diag_pixels, 3u);
++	}
++	if (sweet_fb_rot_cover.rot != 0 && sweet_fb_cover_pixels != 0) {
++		sweet_fb_hud_paint_one(&sweet_fb_rot_cover, sweet_fb_cover_pixels, 2u);
++	}
++}
  
  enum {
  	kSweetFBGetLayerDefaultSurface  = 3,
-@@ -176,6 +937,81 @@
+@@ -176,6 +1042,83 @@
  	}
  	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
  	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
@@ -836,6 +941,8 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +		/* q2q fold modes: remember how the views were built so a switch can rebuild them */
 +		uint32_t modes = 0;
 +		(void)PE_parse_boot_argn("q2qmodes", &modes, sizeof(modes));
++		(void)PE_parse_boot_argn("q2qhud", &sweet_fb_hud_on, sizeof(sweet_fb_hud_on));
++		(void)PE_parse_boot_argn("q2qhudauto", &sweet_fb_hud_autoon, sizeof(sweet_fb_hud_autoon));
 +		sweet_fb_mode_rot = sweet_fb_rot_state.rot;
 +		(void)PE_parse_boot_argn("sweetfb_fill", &sweet_fb_mode_fill, sizeof(sweet_fb_mode_fill));
 +		(void)PE_parse_boot_argn("sweetfb_cfill", &sweet_fb_mode_cfill, sizeof(sweet_fb_mode_cfill));
@@ -860,7 +967,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  	fLock = IOLockAlloc();
  	fClients = OSArray::withCapacity(4);
  	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
-@@ -212,6 +1048,29 @@
+@@ -212,6 +1155,33 @@
  	AppleCLCD *fb = (AppleCLCD *)owner;
  	uint64_t now = mach_absolute_time();
  	uint64_t count = ++fb->fVsyncCount;
@@ -887,10 +994,14 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +			    sweet_fb_mode_switches);
 +		}
 +	}
++	if (sweet_fb_hud_redraw && !fb->fPowerOff) {
++		sweet_fb_hud_redraw = 0;   /* q2q info panel: show at once, even on a still screen */
++		sweet_fb_hud_paint();
++	}
  	uint64_t values[6] = {
  		(uint32_t)count, (uint32_t)(count >> 32),
  		(uint32_t)now, (uint32_t)(now >> 32),
-@@ -238,6 +1097,15 @@
+@@ -238,6 +1208,15 @@
  					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
  				}
  			}
@@ -906,7 +1017,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
  		}
  		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
  		return;
-@@ -359,6 +1227,44 @@
+@@ -359,6 +1338,45 @@
  		if (dx < 0 || dy < 0) {
  			dx = dy = 0;
  		}
@@ -944,6 +1055,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 +				}
 +				/* inner panel + (duo) cover window, split over several cores */
 +				sweet_fb_present_rect(fPixels, src + s->offset, s->bytesPerRow, sx, sy, dx, dy, w, h);
++				sweet_fb_hud_paint();   /* q2q info panel over the new frame, while active */
 +			}
 +			s->release();
 +			continue;

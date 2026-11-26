@@ -55,10 +55,10 @@ index fde499c..da1fabc 100644
  	 * Generate a corefile/crashlog if:
 diff --git a/bsd/kern/q2q_proclog.c b/bsd/kern/q2q_proclog.c
 new file mode 100644
-index 0000000..481b863
+index 0000000..a0ee3de
 --- /dev/null
 +++ b/bsd/kern/q2q_proclog.c
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,91 @@
 +/*
 + * q2q app start/stop log (2026-11-24). Tapping Settings shows nothing and no CRASH line is
 + * printed, so the app is either never started or ends without a core-dumping signal (killed by
@@ -76,6 +76,7 @@ index 0000000..481b863
 +#include <pexpert/pexpert.h>
 +
 +extern void sweet_fb_diag(unsigned line, const char *text);
++extern void sweet_fb_hud_auto(unsigned seconds);   /* q2q info panel (SweetFramebuffer) */
 +
 +void q2q_proclog(char tag, const char *name, int rv, uint32_t ns, uint64_t code);
 +
@@ -139,4 +140,13 @@ index 0000000..481b863
 +		sweet_fb_diag(Q2Q_PL_FIRST + i, q2q_pl_ring[(q2q_pl_head + (int)i) % (int)Q2Q_PL_LINES]);
 +	}
 +	printf("Q2QPL %s\n", l);
++	/*
++	 * 2026-11-26: pop the info panel up when a watched app ends abnormally, so the reason can
++	 * be photographed in the normal build. SpringBoard and backboardd are left out: the fold
++	 * switch restarts them with SIGKILL on purpose.
++	 */
++	if (tag == 'X' && (WIFSIGNALED(rv) || WEXITSTATUS(rv) != 0) &&
++	    strcmp(name, "SpringBoard") != 0 && strcmp(name, "backboardd") != 0) {
++		sweet_fb_hud_auto(15);
++	}
 +}

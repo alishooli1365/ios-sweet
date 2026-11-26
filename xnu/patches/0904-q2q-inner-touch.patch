@@ -24,10 +24,10 @@ index 6630131..5055806 100644
  bsd/dev/sweet_usb.c			standard
 diff --git a/bsd/dev/q2q_keys.c b/bsd/dev/q2q_keys.c
 new file mode 100644
-index 0000000..975b29e
+index 0000000..ae53127
 --- /dev/null
 +++ b/bsd/dev/q2q_keys.c
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,244 @@
 +/*
 + * q2q (Samsung Galaxy Z Fold3, SM8350) buttons for ios-sweet XNU: power, volume up, volume
 + * down, polled every 20 ms and reported with sweet_hid_key(). Same approach as ios-sweet's
@@ -48,6 +48,7 @@ index 0000000..975b29e
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 +extern void sweet_hid_key(int key, int down);
++extern void sweet_fb_hud_show(unsigned seconds);   /* q2q info panel (SweetFramebuffer) */
 +extern void sweet_fb_diag(unsigned line, const char *text);
 +void q2q_keys_init(void);
 +
@@ -173,6 +174,8 @@ index 0000000..975b29e
 +{
 +	int state[Q2QK_N] = {0, 0, 0};
 +	unsigned errors = 0;
++	unsigned combo_polls = 0;
++	bool combo_fired = false;
 +	char b[48];
 +	(void)arg;
 +	(void)res;
@@ -194,6 +197,21 @@ index 0000000..975b29e
 +				sweet_fb_diag(QK_DL + 1, b);
 +				sweet_hid_key(k, state[k]);
 +			}
++		}
++		/*
++		 * q2q info panel (2026-11-26): Vol Up + Vol Down held together ~1 s (50 polls of 20 ms)
++		 * shows the diagnostic lines over the picture for 20 s, once per hold.
++		 */
++		if (state[Q2QK_VOLUP] && state[Q2QK_VOLDOWN]) {
++			if (combo_polls < 50u) {
++				combo_polls++;
++			} else if (!combo_fired) {
++				combo_fired = true;
++				sweet_fb_hud_show(20);
++			}
++		} else {
++			combo_polls = 0;
++			combo_fired = false;
 +		}
 +		qk_wait_ms(20);
 +	}
